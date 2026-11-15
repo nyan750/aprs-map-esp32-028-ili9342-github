@@ -3643,8 +3643,8 @@ static void touchLoop() {
   touchWasDown = true;
   if (now - lastTouchMs < 300) return;         // action debounce
   lastTouchMs = now;
-  int x = constrain(map(p.x, 200, 3700, 0, 319), 0, 319);   // 2432S028 standard
-  int y = constrain(map(p.y, 240, 3800, 0, 239), 0, 239);
+  int x = constrain(map(p.x, 200, 3700, 319, 0), 0, 319);   // new unit: touch X inverted too (2026-11-15)
+  int y = constrain(map(p.y, 240, 3800, 239, 0), 0, 239);   // new unit: touch Y inverted (2026-11-15)
   handleTouch(x, y);
 }
 
@@ -3658,7 +3658,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer 028 v81N");
+  tft.print("APRS Map Viewer 028 v83N");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
