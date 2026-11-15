@@ -16,7 +16,11 @@ ESP32-2432S028（2.8インチ CYD、抵抗膜タッチ）で動く、APRS・航�
 | FLIGHT | 設定中心の周辺（広域） | ADS-B 航空機（adsb.lol、60秒ごとに取得） |
 | AIS | FLIGHT と同じ地図 | AIS 船舶（aisstream.io、APIキーが必要） |
 
-地図は本体内蔵＋本体生成のため、SDカードは不要です。
+地図は本体内蔵＋本体生成のため、SDカードは不要です。<br>
+
+<img src="aprs1.png" width="300"><br>
+<img src="frigh1.png" width="300"><br>
+<img src="ais1.png" width="300"><br>
 
 ## 特徴
 
