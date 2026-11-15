@@ -137,7 +137,7 @@ Wi-Fi SSID / パスワード、コールサイン、APRS パスコード（0 = �
 
 設定画面（未入力の状態）:
 
-![設定画面](<img src="portal.png" width="300" alt="設定画面">)
+![設定画面](<img src="portal.png" width="300">)
 
 ## 地図データについて
 
