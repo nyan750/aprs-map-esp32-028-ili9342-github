@@ -18,9 +18,9 @@ ESP32-2432S028（2.8インチ CYD、抵抗膜タッチ）で動く、APRS・航�
 
 地図は本体内蔵＋本体生成のため、SDカードは不要です。<br>
 
-<img src="aprs1.png" width="300"><br>
-<img src="frigh1.png" width="300"><br>
-<img src="ais1.png" width="300"><br>
+<img src="aprs1.png" alt="APRS画面" width="240"><br>
+<img src="frigh1.png" alt="FLIGHT画面" width="240"><br>
+<img src="ais1.png" alt="AIS画面" width="240"><br>
 
 ## 特徴
 
