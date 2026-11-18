@@ -53,8 +53,8 @@ public:
     {
       auto cfg = _light.config();
       cfg.pin_bl      = 21;
-      cfg.invert      = false;
-      cfg.freq        = 44100;
+      cfg.invert      = false;   // v159N: HIGH is the ON state (v156N post-mortem)
+      cfg.freq        = 5000;    // v153N: 44.1 kHz may exceed the LEDC resolution budget
       cfg.pwm_channel = 7;
       _light.config(cfg);
       _panel.setLight(&_light);

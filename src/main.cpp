@@ -27,12 +27,12 @@
 #include "lgfx/utility/lgfx_miniz.h"   // tinfl inflate, already linked via LovyanGFX
 #include <esp_system.h>
 #include <XPT2046_Touchscreen.h>
-#include "LGFX_028.h"
+#include "LGFX_028.h"   // NEW 028 unit: ILI9342 (the GitHub unit)
 #include "config.h"
 #include "maps_data.h"   // embedded 4-bit grayscale maps (no SD card needed)
 
 LGFX tft;
-static SPIClass touchSPI(VSPI);
+static SPIClass touchSPI(VSPI);   // 028: touch on its own bus
 // NOTE: no TIRQ pin on purpose. The library's update() is gated by an
 // ISR wake flag that a low-pressure read can clear, which makes polling
 // die until the next interrupt edge. With tirq=255 the flag stays set
@@ -40,7 +40,7 @@ static SPIClass touchSPI(VSPI);
 static XPT2046_Touchscreen ts(33);       // CS=33
 
 // The touch panel has the VSPI bus to itself (maps live in flash now).
-static void touchRoute() { touchSPI.end(); touchSPI.begin(25, 39, 32, 33); }
+static void touchRoute() { touchSPI.end(); touchSPI.begin(25, 39, 32, 33); }   // 028: CLK25/MISO39/MOSI32/CS33
 
 // ---------------- settings (phone setup portal, Plane Radar style) ----
 // config.h holds only the factory defaults; the live settings are kept
@@ -51,6 +51,7 @@ static String cfgAisKey;
 static int cfgPasscode = 0;
 static double homeLat = FILTER_LAT, homeLon = FILTER_LON;
 static int cfgRangeKm = FILTER_RANGE_KM;
+static int cfgScreens = 7;   // v175N: which screens are shown (portal setting)
 static WebServer cfgServer(80);
 static DNSServer dnsServer;
 static bool cfgServerStarted = false;
@@ -81,6 +82,8 @@ static void loadSettings(bool skipNvs) {
   homeLat = p.getDouble("lat", homeLat);
   homeLon = p.getDouble("lon", homeLon);
   cfgRangeKm = p.getInt("range", cfgRangeKm);
+  cfgScreens = p.getInt("screens", cfgScreens);
+  if (cfgScreens < 1 || cfgScreens > 7) cfgScreens = 7;
   p.end();
 }
 
@@ -105,6 +108,7 @@ static void handleRoot() {
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>APRS Map Setup</title><style>body{font-family:sans-serif;margin:16px}"
     "label{display:block;margin-top:12px}input{width:100%;padding:8px;font-size:16px;box-sizing:border-box}"
+    "input[type=checkbox]{width:auto;padding:0;margin-right:8px}"
     "button{margin-top:16px;width:100%;padding:12px;font-size:16px}</style></head><body>"
     "<h2>APRS Map 設定</h2><form method='POST' action='/save'>";
   h += "<label>Wi-Fi SSID<input name='ssid' value='" + htmlEsc(cfgSsid) + "'></label>";
@@ -115,9 +119,26 @@ static void handleRoot() {
   h += "<label>中心の経度<input name='lon' value='" + String(lonBuf) + "'></label>";
   h += "<label>受信範囲 km<input name='range' type='number' value='" + String(cfgRangeKm) + "'></label>";
   h += "<label>AIS APIキー (aisstream.io)<input name='aiskey' value='" + htmlEsc(cfgAisKey) + "'></label>";
+  // v175N: screen selection (user request) - unselected screens
+  // are not shown at all, not even as a tab in the top bar.
+  h += "<p style='margin-top:16px;font-weight:bold'>表示する画面</p>";
+  h += "<label><input type='checkbox' name='scrall' value='1'" + String(cfgScreens == 7 ? " checked" : "") + ">全部表示</label>";
+  h += "<label><input type='checkbox' name='scr0' value='1'" + String(cfgScreens & 1 ? " checked" : "") + ">APRS</label>";
+  h += "<label><input type='checkbox' name='scr1' value='1'" + String(cfgScreens & 2 ? " checked" : "") + ">FLIGHT</label>";
+  h += "<label><input type='checkbox' name='scr2' value='1'" + String(cfgScreens & 4 ? " checked" : "") + ">AIS</label>";
+  h += "<p>「全部表示」を選ぶと3画面すべて表示します。選ばれなかった画面は、上段のタブも含めて表示されません。1つも選ばれていない場合は全部表示になります。</p>";
   h += "<button type='submit'>保存して再起動</button></form>"
-       "<p>設定は本体に保存されます。config.h は初期値です。</p>"
-       "<p><a href='/mapgen'>地図を作り直す</a>（中心の緯度経度に合わせて再生成します。数分かかります）</p></body></html>";
+       "<p>設定は本体に保存されます。config.h は初期値です。</p>";
+  // v105: the map-generation note is larger, and explains the area
+  // (v103: one map matched to the centre + receive range, shared by
+  // all three tabs), with the user's actual range filled in.
+  h += "<p style='font-size:1.3em;line-height:1.5'><a href='/mapgen'>地図を作り直す</a><br>"
+       "地図は1枚だけ作り、APRS／FLIGHT／AISの全画面で共用します。"
+       "範囲は「中心の緯度経度」と「受信範囲」に合わせます（受信範囲が "
+    + String(cfgRangeKm) + " km なら、中心から上下左右 " + String(cfgRangeKm)
+    + " km、約 " + String(cfgRangeKm * 2) + " km 四方）。"
+       "中心や受信範囲を変えたときは、地図を作り直してください。"
+       "生成には約45分かかります。生成中は電源を切らないでください。</p></body></html>";
   cfgServer.send(200, "text/html", h);
 }
 
@@ -141,6 +162,16 @@ static void handleSave() {
     }
     int rg = cfgServer.arg("range").toInt();
     if (rg >= 10 && rg <= 500) p.putInt("range", rg);
+    // v175N: screen selection (checkboxes arrive only when ticked)
+    int scr = 0;
+    if (cfgServer.hasArg("scrall")) scr = 7;
+    else {
+      if (cfgServer.hasArg("scr0")) scr |= 1;
+      if (cfgServer.hasArg("scr1")) scr |= 2;
+      if (cfgServer.hasArg("scr2")) scr |= 4;
+      if (scr == 0) scr = 7;   // none ticked: show everything
+    }
+    p.putInt("screens", scr);
     p.end();
   }
   cfgServer.send(200, "text/html",
@@ -158,11 +189,13 @@ static void handleMapGen() {
   p.begin("aprsmap", false);
   p.putBool("mgforce", true);
   p.end();
-  cfgServer.send(200, "text/html",
-    "<!DOCTYPE html><html lang='ja'><meta charset='utf-8'>"
+  String mp = "<!DOCTYPE html><html lang='ja'><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<body style='font-family:sans-serif;margin:16px'><h2>地図を再生成します</h2>"
-    "<p>再起動して、中心の緯度経度に合わせて地図を作り直します（数分かかります）。</p></body></html>");
+    "<p>再起動して、中心の緯度経度と受信範囲（" + String(cfgRangeKm)
+    + " km）に合わせた1枚の地図を作り直します（約45分かかります）。"
+      "生成中は電源を切らないでください。</p></body></html>";
+  cfgServer.send(200, "text/html", mp);
   delay(1000);
   ESP.restart();
 }
@@ -326,9 +359,44 @@ static RouteInfo routeCache[12];
 static int routeNext = 0;
 static uint32_t lastAcFetchMs = 0;
 static uint16_t* mapChunk = nullptr;   // 60-row map render chunk (38,400 B, v76)
+// v104: the ADS-B fetch runs on a Core 0 task so its multi-second
+// blocking HTTPS no longer freezes touch / redraw on Core 1 (the
+// user-visible ~60 s freeze). chunkMutex guards mapChunk's lifetime:
+// the fetch task frees it for TLS heap while drawMap (Core 1) may be
+// rendering from it. acMutex guards the aircraft table swap.
+static Aircraft acBack[MAX_AC];
+static volatile bool acFetchReq = false, acDataReady = false;
+static volatile bool acFetchBusy = false;   // v107: a fetch is in flight
+static volatile bool aisConnectReq = false;   // v108: AIS connect request
+static volatile bool aisPauseReq = false;     // v151N: fetch asks AIS to drop
+// v165N: Core 1 never touches the AIS socket directly any more.
+// The v164N panic backtrace ran loop -> sendAisSubscription ->
+// WiFiClientSecure::write -> stop -> mbedtls_ssl_free -> CORRUPT
+// HEAP assert: Core 1 writing/stopping the socket races this
+// task's connect/teardown churn on the same SSL object. Core 1
+// only raises these flags; the Core 0 task performs the ops.
+static volatile bool aisStopReq = false;
+static volatile bool aisSubSendReq = false;
+static volatile bool aisPingReq = false;
+static volatile bool aisPongReq = false;
+static uint8_t aisPongBuf[128];
+static volatile size_t aisPongLen = 0;
+static bool sendAisSubscription();            // fwd
+static bool wsSendFrame(uint8_t opcode, const uint8_t* data, size_t len);   // fwd
+static bool colourMapActive();                // v151N: defined at genColorActive
+static bool aisConnect();                     // v108: defined with the AIS code
+static void aisServiceSocketReqs();           // v165N: ditto
+static SemaphoreHandle_t acMutex = nullptr, chunkMutex = nullptr;
+static void freeMapChunk() {
+  if (chunkMutex) xSemaphoreTake(chunkMutex, portMAX_DELAY);
+  if (mapChunk) { free(mapChunk); mapChunk = nullptr; }
+  if (chunkMutex) xSemaphoreGive(chunkMutex);
+}
 #define MAP_CHUNK_ROWS 60
 static bool acFetchedOnce = false;
 #define AC_POLL_MS 60000
+static int acFailStreak = 0;              // v161N: failure backoff
+static uint32_t acIntervalMs = AC_POLL_MS;
 
 static bool jsonStrField(const String& s, const char* key, int from, int to, char* out, size_t outSz) {
   int k = s.indexOf(key, from);
@@ -349,13 +417,76 @@ static bool jsonNumField(const String& s, const char* key, int from, int to, dou
 
 // Pull the aircraft within AC_DIST_NM of the filter centre from the
 // community ADS-B feed and replace the table (each reply is complete).
+// v130: TLS heap escrow. Two TLS clients now coexist (the persistent
+// AIS socket + this ADS-B fetch), and in colour mode the heap layout
+// no longer leaves the ~45 KB the adsb.lol handshake needs in
+// reachable blocks - the fetch failed with http -1 (largest block
+// 40,948) while the AIS TLS connect still succeeded. A 40 KB block
+// reserved at boot is freed just for the fetch, so the handshake can
+// carve its buffers out of one fresh contiguous hole, then taken
+// back. If the re-allocation fails the fetch simply retries next
+// minute without the escrow (degraded, not broken).
+#define TLS_RESERVE_BYTES 57344   // v162N: 56 KB (was 40 KB)
+static void* tlsReserve = nullptr;
+static size_t tlsReserveBytes = 0;
+// v164N: one re-take path for every call site. The v163N lesson:
+// the AIS connect frees the 56 KB reserve, handshakes into the
+// hole and leaves its session buffers there, so the full-size
+// re-take failed and every later fetch ran with reserve 0x0.
+// Take the largest size that still fits instead of nothing.
+static void tlsReserveRetake() {
+  if (tlsReserve) return;
+  static const size_t sizes[] = { TLS_RESERVE_BYTES, 49152, 40960, 32768 };
+  for (size_t sz : sizes) {
+    tlsReserve = heap_caps_malloc(sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (tlsReserve) {
+      tlsReserveBytes = sz;
+      if (sz < TLS_RESERVE_BYTES)
+        Serial.printf("tls reserve: shrunk to %u\n", (unsigned)sz);
+      return;
+    }
+  }
+  tlsReserveBytes = 0;
+  Serial.println("tls reserve: FAILED");
+}
+static void wsInflateReleasePair();   // v143N: defined by wsInflate
+static void wsInflateReclaimPair();   // v143N
+static void fetchAircraftDo();
 static void fetchAircraft() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  // The map render chunk (38,400 B) squeezes the heap that TLS and the
-  // response String need; hand it back (drawMap re-allocates on demand).
-  if (mapChunk) { free(mapChunk); mapChunk = nullptr; }
+  if (tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
+  fetchAircraftDo();
+  tlsReserveRetake();
+}
+static bool fetchAircraftInner() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  // v137: free the chunk for the handshake again (the v136 log
+  // proved the failure is an X509 cert-chain allocation inside
+  // mbedTLS - the handshake needs every KB it can get). The v134
+  // pin is replaced by the drawMap gate above: while acFetchBusy
+  // is set, drawMap leaves the chunk free and renders line-by-line,
+  // so nothing steals the headroom mid-handshake.
+  freeMapChunk();
+  // v151N: with AIS live (v149N), its TLS session buffers are the
+  // last big DMA consumer, and the ADS-B handshake now dies one
+  // stage deeper ('PK - Memory allocation failed'). In LINE mode
+  // only, ask aisLoop to drop the stream for this fetch and wait
+  // until it has (aisLoop owns the socket; it reconnects ~20 s
+  // later, gated on !acFetchBusy). Colour mode has the sea mask's
+  // 38 KB back in the pool and needs no pause.
+  if (!colourMapActive()) {
+    aisPauseReq = true;
+    uint32_t t0 = millis();
+    while (aisPauseReq && millis() - t0 < 2000) delay(5);
+  }
+  // v138 diag: exact heap state the handshake starts from
+  Serial.printf("ADS-B fetch start: free %u largest %u dmaFree %u dmaLargest %u reserveBytes %u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                (unsigned)tlsReserveBytes);
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setInsecure();   // (this core's WiFiClientSecure has no setBufferSizes)
   HTTPClient http;
   http.setTimeout(12000);
   int distNm = (int)(cfgRangeKm / 1.852);
@@ -364,17 +495,35 @@ static void fetchAircraft() {
   char url[128];
   snprintf(url, sizeof(url), "https://api.adsb.lol/v2/lat/%.4f/lon/%.4f/dist/%d",
            homeLat, homeLon, distNm);
-  if (!http.begin(client, url)) return;
+  if (!http.begin(client, url)) return false;
   int code = http.GET();
+  if (code < 0) {
+    // v136: capture the BearSSL error (discriminates handshake
+    // alert vs timeout vs OOM - plain "-1" hid which), then retry
+    // once; the failures are intermittent.
+    char ebuf[80];
+    client.lastError(ebuf, sizeof(ebuf));
+    Serial.printf("ADS-B http %d ssl: %s (free %u largest %u)\n", code, ebuf,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    http.end();
+    delay(700);
+    if (!http.begin(client, url)) return false;
+    code = http.GET();
+    if (code < 0) {
+      client.lastError(ebuf, sizeof(ebuf));
+      Serial.printf("ADS-B retry http %d ssl: %s\n", code, ebuf);
+    }
+  }
   if (code != 200) {
     Serial.printf("ADS-B http %d (largest heap %u)\n", code,
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    http.end(); return;
+    http.end(); return false;
   }
   String body = http.getString();
   http.end();
   int acPos = body.indexOf("\"ac\":");
-  if (acPos < 0) { Serial.printf("ADS-B bad body, len %u\n", (unsigned)body.length()); return; }
+  if (acPos < 0) { Serial.printf("ADS-B bad body, len %u\n", (unsigned)body.length()); return false; }
   int n = 0;
   int pos = acPos;
   while (n < MAX_AC) {
@@ -386,7 +535,7 @@ static void fetchAircraft() {
     char fl[16] = "";
     if (jsonNumField(body, "\"lat\":", h, segEnd, la) &&
         jsonNumField(body, "\"lon\":", h, segEnd, lo)) {
-      Aircraft& a = aircraft[n];
+      Aircraft& a = acBack[n];
       jsonStrField(body, "\"flight\":\"", h, segEnd, fl, sizeof(fl));
       // trim the padding spaces the feed puts in callsigns
       int L = strlen(fl);
@@ -407,8 +556,67 @@ static void fetchAircraft() {
     if (next < 0) break;
     pos = next;
   }
+  if (acMutex) xSemaphoreTake(acMutex, portMAX_DELAY);
+  memcpy(aircraft, acBack, sizeof(acBack));
   acCount = n;
-  Serial.printf("aircraft: %d\n", acCount);
+  if (acMutex) xSemaphoreGive(acMutex);
+  acDataReady = true;
+  Serial.printf("aircraft: %d\n", n);
+  return true;
+}
+
+// v143N: the handshake was still starving with the pair held
+// (v142N log: dmaFree 47240 at fetch start, X509 alloc failed -
+// the handshake needs more TOTAL DMA room, not just a big block).
+// The AIS inflate pair (~39 KB of DMA) is not needed while no ship
+// message is being decompressed, so lend it to the handshake and
+// re-allocate it right after; wsInflate drops messages while the
+// pair is out (rare, and self-healing at the reclaim).
+static void fetchAircraftDo() {
+  wsInflateReleasePair();
+  bool ok = fetchAircraftInner();
+  wsInflateReclaimPair();
+  // v161N: the endpoint is healthy (verified from the host) but
+  // the device's connections are reset every cycle (NET_RECV_
+  // FAILED) - the signature of per-IP rate limiting after a day
+  // of 1-minute polls and test churn. Back off exponentially
+  // (2, 4, 8, 15 min cap) and reset on the first success; this
+  // also stops the serial error flood the user pointed at.
+  if (ok) { acFailStreak = 0; acIntervalMs = AC_POLL_MS; }
+  else {
+    acFailStreak++;
+    uint32_t iv = AC_POLL_MS << (acFailStreak > 4 ? 4 : acFailStreak);
+    acIntervalMs = iv > 900000 ? 900000 : iv;
+    if (acFailStreak >= 2)
+      Serial.printf("ADS-B backoff: next fetch in %lu min\n",
+                    (unsigned long)(acIntervalMs / 60000));
+  }
+}
+
+static void acFetchTask(void* arg) {
+  (void)arg;
+  for (;;) {
+    aisServiceSocketReqs();   // v165N: AIS socket writes/stops live on this task
+    if (acFetchReq && !tlsReserve) {
+      // v170N reserve recovery: the reserve degrades with uptime
+      // (57K -> 32K -> FAILED) as retakes lose to fragmentation,
+      // and FLIGHT then stays dead until a reboot. Before this
+      // fetch, drop the AIS stream - deleting its client truly
+      // frees the TLS buffers - and free the map chunk, then
+      // re-take on the temporarily roomier pool.
+      aisPauseReq = true;
+      uint32_t t0 = millis();
+      while (aisPauseReq && millis() - t0 < 2000) delay(5);
+      aisServiceSocketReqs();   // performs the pending destroy
+      freeMapChunk();
+      tlsReserveRetake();
+      Serial.printf("tls reserve recovery: %s (%u bytes)\n",
+                    tlsReserve ? "ok" : "FAILED", (unsigned)tlsReserveBytes);
+    }
+    if (acFetchReq) { acFetchReq = false; acFetchBusy = true; fetchAircraft(); acFetchBusy = false; }
+    if (aisConnectReq) { aisConnectReq = false; acFetchBusy = true; aisConnect(); acFetchBusy = false; }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
 }
 
 static RouteInfo* findRoute(const char* fl) {
@@ -420,6 +628,7 @@ static RouteInfo* findRoute(const char* fl) {
 // Fetch the route for one callsign (once, then cached). Blocking ~1 s.
 static void ensureRoute(const char* fl) {
   if (findRoute(fl)) return;
+  if (acFetchBusy) return;   // v107: never two TLS handshakes at once
   RouteInfo& r = routeCache[routeNext];
   routeNext = (routeNext + 1) % 12;
   memset(&r, 0, sizeof(r));
@@ -581,8 +790,8 @@ static bool   geoToPx(double lat, double lon, int& px, int& py);
 #undef MAPS
 #define MAP_COUNT 2
 static MapDef MAP_LIST[MAP_COUNT] = {   // non-const: bounds are replaced when generated maps are active (v79)
-  { "/map1.bmp", "KAGAWA",  34.60, 33.90, 133.40, 134.90 },  // APRS screen: Kagawa only (z11 source)
-  { "/map2.bmp", "OKAYAMA", 35.40, 33.90, 133.25, 134.95 },  // Flight screen: Okayama + Kagawa
+  { "/map1.bmp", "MAP1",  35.90, 35.30, 139.30, 140.20 },  // example bounds (Tokyo area) - replaced by the generated map
+  { "/map2.bmp", "MAP2",  35.80, 35.55, 139.55, 139.95 },  // example bounds (Tokyo area)
 };
 
 // ---------------- on-device map generation (v80: synced with the M5 build v8.21) --------
@@ -593,7 +802,7 @@ static MapDef MAP_LIST[MAP_COUNT] = {   // non-const: bounds are replaced when g
 // standard tiles' sea mask, downscales to the usual 640x480 4-bit
 // gray + class-bit format, and stores the result in the dedicated
 // "mapdata" flash partition. The renderer then reads the generated
-// maps through a flash mmap instead of the baked-in Takamatsu maps,
+// maps through a flash mmap instead of the baked-in maps,
 // which remain the fallback. Map bounds mirror make_maps.py's layout
 // relative to the centre. PNG decoding: pngle (c) kikuchan, MIT.
 // Prototype simplifications vs the PC pipeline: no place-name text
@@ -607,6 +816,13 @@ static MapDef MAP_LIST[MAP_COUNT] = {   // non-const: bounds are replaced when g
 #define GEN_SCR_SEA  (GEN_SCR_OFF + 307200)
 #define GEN_TOTAL_END (GEN_SCR_SEA + 307200)
 #define GEN_STAGE_OFF GEN_TOTAL_END   // v6: raw-tile stage up to partition end
+// v123: stored SEA plane (one bit per output pixel, majority sea
+// fraction from GSI pale tiles), kept OUTSIDE the two map blocks so
+// pre-v123 maps still activate (they just fall back to the flood
+// fill). Slot i plane at GEN_SEA_OFF + i * GEN_SEA_BYTES.
+#define GEN_SEA_OFF (GEN_HDR_BYTES + 2 * GEN_MAP_BYTES)
+#define GEN_SEA_BYTES 38400
+#define GEN_SEA_MAGIC 0x53454131u        // 'SEA1' 
 
 struct GenHeader {
   uint32_t magic, ver;
@@ -620,6 +836,9 @@ static const esp_partition_t* genPart = nullptr;
 static const uint8_t* genMapPtr = nullptr;   // mmap base of genPart
 static spi_flash_mmap_handle_t genMmapH = 0;
 static bool genMapsActive = false;
+static bool genSeaValid = false;                 // v123
+static const uint8_t* genSeaPtr[2] = { nullptr, nullptr };   // v123
+static uint32_t mgSeaSum = 0;                     // v123: pass-2 sea byte sum
 static const uint8_t* mapGrayPtr[2]  = { MAP_GRAY[0],  MAP_GRAY[1] };
 static const uint8_t* mapClassPtr[2] = { MAP_CLASS[0], MAP_CLASS[1] };
 
@@ -645,7 +864,7 @@ static void mgShow(const char* l1, const char* l2, int pct) {
 }
 
 // ---- pass 1: tile streaming into per-output-row aggregates ----
-static int mgMode = 0;                     // 0 = std tile (sea bits), 1 = blank (accumulate)
+static int mgMode = 0;                     // 0 = pale tile (sea bits), 1 = blank (accumulate)
 static int mgTileOx = 0, mgTileOy = 0;     // global px of tile top-left
 // Generation-only scratch lives in ONE heap block (allocated in
 // mgOneMap, freed on exit) - as statics it overflowed DRAM BSS.
@@ -656,6 +875,7 @@ static bool mgAllocPng();          // v6: defined near mapGenBoot
 static int mgRangeKm();            // v8.13: defined near mgActivate
 static bool mgAllocWorkBuffers();
 static void mgFreeWorkBuffers();   // v7.1 forward declaration
+static bool mgAllocColourBuffers();   // v124 forward declaration
 // v5.17: aggregates are two separate 10 KB allocations (mgAggGray/Sea)
 static int mgLastHttp = 0;         // last non-200 tile http code
 static int mgTilesOk = 0;          // tiles fetched OK in this generation
@@ -667,12 +887,21 @@ static uint8_t* mgScrSeaRow = nullptr;     // [640]
 static uint8_t* mgGrayCur = nullptr;       // [640] pass 2 row being emitted
 static uint8_t* mgRingInk = nullptr;       // [13*80] packed bits
 static uint8_t* mgRingSea = nullptr;       // [13*80] packed bits
+static uint8_t* mgRingSea50 = nullptr;     // v123: [13*80] majority-sea bits
 static int mgRingRow[13];
 static int mgCropX0 = 0, mgCropY0 = 0, mgCropW = 0, mgCropH = 0;
 static int mgBandOy0 = 0, mgBandRows = 0;
 static int mgStripX0 = 0;   // v6: output column where the current strip starts
 static uint8_t* mgAggGray = nullptr;       // [bandRows][640] min luminance
 static uint8_t* mgAggSea = nullptr;        // [bandRows][640] sea pixel count
+static uint16_t* mgColR = nullptr;         // v124: colour aggregates [160*32]
+static uint16_t* mgColG = nullptr;
+static uint16_t* mgColB = nullptr;
+static uint8_t*  mgColN = nullptr;
+static uint32_t  mgImgSum = 0;             // v124: emitted image byte sum
+static bool genColorActive = false;        // v124: stored colour image in use
+static bool colourMapActive() { return genColorActive; }   // v151N
+static const uint8_t* genColorPtr = nullptr;
 static uint32_t mgWdtCtr = 0;
 static long mgPixels = 0;          // v6.3: pixels drawn by the current decode
 static char mgFailDetail[80] = ""; // v6.3: extra line for the FAILED screen
@@ -698,6 +927,25 @@ static void mgAccum(int gx, int gy, int r, int g, int b, int lx, int ly) {
   }
 }
 
+// v124: colour accumulation - the same crop->output scatter as
+// mgAccum, but averaging the pale tile's true colours per output
+// pixel (sums in uint16: at most ~30 source px per output px).
+static void mgAccumC(int gx, int gy, int r, int g, int b) {
+  int cx = gx - mgCropX0, cy = gy - mgCropY0;
+  if (cx < 0 || cy < 0 || cx >= mgCropW || cy >= mgCropH) return;
+  int oy = (int)((double)cy * 480.0 / mgCropH);
+  int ox = (int)((double)cx * 640.0 / mgCropW);
+  int lo = oy - mgBandOy0;
+  if (lo < 0 || lo >= mgBandRows) return;
+  int sx = ox - mgStripX0;
+  if (sx < 0 || sx >= 160) return;
+  int i = lo * 160 + sx;
+  mgColR[i] = (uint16_t)(mgColR[i] + r);
+  mgColG[i] = (uint16_t)(mgColG[i] + g);
+  mgColB[i] = (uint16_t)(mgColB[i] + b);
+  if (mgColN[i] < 255) mgColN[i]++;
+}
+
 static void mgDrawCb(pngle_t* png, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                      const uint8_t rgba[4]) {
   (void)png;
@@ -707,12 +955,19 @@ static void mgDrawCb(pngle_t* png, uint32_t x, uint32_t y, uint32_t w, uint32_t 
       int lx = (int)x + (int)dx, ly = (int)y + (int)dy;
       if (lx > 255 || ly > 255) continue;
       if (mgMode == 0) {
-        int bb = rgba[2], rr = rgba[0];
-        if (bb - rr > 25 && bb > 120)
+        // v123: the sea tile layer is now GSI "pale" - its water is
+        // ONE flat colour (190,210,255), verified on a real tile.
+        // The old std-tile heuristic (b-r>25) also fired on std's
+        // park/river blues and fed the flood fill years of false
+        // coast ink. Shape test with AA tolerance:
+        int bb = rgba[2], gg = rgba[1], rr = rgba[0];
+        if (bb >= 250 && bb - rr >= 40 && bb - gg >= 25 && rr < 230)
           mgSeaBits[ly * 32 + (lx >> 3)] |= (uint8_t)(0x80 >> (lx & 7));
       } else if (mgMode == 1) {
         mgAccum(mgTileOx + lx, mgTileOy + ly, rgba[0], rgba[1], rgba[2], lx, ly);
-      }   // mode 2 = warm-up fetch: decode but discard every pixel
+      } else if (mgMode == 2) {   // v124: colour accumulate
+        mgAccumC(mgTileOx + lx, mgTileOy + ly, rgba[0], rgba[1], rgba[2]);
+      }
     }
   if ((++mgWdtCtr & 0x3FF) == 0) esp_task_wdt_reset();
 }
@@ -935,7 +1190,7 @@ static bool mgDecodeStaged(int rec, int ty, int mode) {
   }
   snprintf(mgFailDetail, sizeof(mgFailDetail),
            "rec%d %s %d/%d f%d px%ld len%u %02x%02x%02x%02x retry %s",
-           rec, mgRecLayer[rec] ? "blank" : "std",
+           rec, mgRecLayer[rec] ? "blank" : "pale",
            mgRecTx[rec], mgRecTy[rec], r, px1, (unsigned)mgRecLen[rec],
            mm4[0], mm4[1], mm4[2], mm4[3], retryOk ? "OK" : "NG");
   return retryOk;
@@ -960,7 +1215,8 @@ static bool mgPrepWorkBuffers() {
   mgScrSeaRow = mgWork + 2400;              // 640
   mgGrayCur = mgWork + 3040;                // 640
   mgRingInk = mgWork + 3680;                // 1040
-  mgRingSea = mgWork + 4720;                // 1040 -> ends 5760
+  mgRingSea = mgWork + 4720;                // 1040
+  mgRingSea50 = mgWork + 5760;              // v123: 1040 -> ends 6800
   memset(mgColW, 0, 640 * 2);
   memset(mgRowH, 0, 480);
   for (int cx = 0; cx < mgCropW; cx++) mgColW[(int)(cx * 640.0 / mgCropW)]++;
@@ -974,13 +1230,15 @@ static void mgLoadRow(int r) {
   if (mgRingRow[s] == r) return;
   esp_partition_read(genPart, GEN_SCR_GRAY + r * 640, mgScrGrayRow, 640);
   esp_partition_read(genPart, GEN_SCR_SEA + r * 640, mgScrSeaRow, 640);
-  for (int xb = 0; xb < 80; xb++) { mgRingInk[s * 80 + xb] = 0; mgRingSea[s * 80 + xb] = 0; }
+  for (int xb = 0; xb < 80; xb++) { mgRingInk[s * 80 + xb] = 0; mgRingSea[s * 80 + xb] = 0; mgRingSea50[s * 80 + xb] = 0; }
   for (int x = 0; x < 640; x++) {
     if (mgScrGrayRow[x] < 245)
       mgRingInk[s * 80 + (x >> 3)] |= (uint8_t)(0x80 >> (x & 7));
     int den = mgColW[x] * mgRowH[r];
     if (den > 0 && (int)mgScrSeaRow[x] * 100 >= 35 * den)
       mgRingSea[s * 80 + (x >> 3)] |= (uint8_t)(0x80 >> (x & 7));
+    if (den > 0 && (int)mgScrSeaRow[x] * 100 >= 50 * den)   // v123: majority sea -> stored plane
+      mgRingSea50[s * 80 + (x >> 3)] |= (uint8_t)(0x80 >> (x & 7));
   }
   mgRingRow[s] = r;
 }
@@ -1020,8 +1278,9 @@ static bool mgStripRecordsValid() {
   return true;
 }
 
-static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z, uint32_t dataOff, uint32_t* sumOut) {
+static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z, uint32_t dataOff, uint32_t* sumOut, bool colour) {
   mgStripNo = 0;   // v8.6
+  mgImgSum = 0;    // v124
   double x0 = mgGx(b[2], z), x1 = mgGx(b[3], z);
   double y0 = mgGy(b[0], z), y1 = mgGy(b[1], z);
   mgCropW = (int)lround(x1 - x0);
@@ -1039,18 +1298,35 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
   // the sea scratch would have ANDed every later sea value to 0.
   // Both scratches are erased here, once per map, and pass 1 writes
   // each scratch row exactly once (RAM row staging below).
-  for (uint32_t off = 0; off < 614400; off += 65536) {
-    uint32_t n = 614400 - off > 65536 ? 65536 : 614400 - off;
-    esp_partition_erase_range(genPart, GEN_SCR_OFF + off, n);
-    esp_task_wdt_reset();
+  if (!colour) {   // v124: colour mode uses no scratch planes
+    for (uint32_t off = 0; off < 614400; off += 65536) {
+      uint32_t n = 614400 - off > 65536 ? 65536 : 614400 - off;
+      esp_partition_erase_range(genPart, GEN_SCR_OFF + off, n);
+      esp_task_wdt_reset();
+    }
   }
   char l2[48];
+  int emittedY = 0;   // v125: colour emit partition guard (below)
   for (int ty = ty0; ty <= ty1; ty++) {
     int cyB0 = ty * 256 - mgCropY0; if (cyB0 < 0) cyB0 = 0;
     int cyB1 = ty * 256 + 255 - mgCropY0; if (cyB1 > mgCropH - 1) cyB1 = mgCropH - 1;
     if (cyB1 < cyB0) continue;
     int bandOy0 = (int)(cyB0 * 480.0 / mgCropH);
     int oyB = (int)(cyB1 * 480.0 / mgCropH);
+    if (colour) {
+      // v125 FIX: adjacent tile rows can claim the SAME boundary
+      // output row (the source->output scale is ~0.3, so
+      // floor((cyB1+1)*480/cropH) often equals oyB). Line mode
+      // never noticed - its scratch merge accumulates across the
+      // overlap - but the colour emit OVERWRITES the row, and a
+      // flash re-write ANDs old and new bytes: the row corrupts
+      // and the header image sum never matches (the user's
+      // 'ACTFAIL colour image' loop). Clamp each band to rows not
+      // yet emitted; the boundary row keeps the previous tile
+      // row's samples (visually identical neighbours).
+      if (bandOy0 < emittedY) bandOy0 = emittedY;
+      if (oyB < bandOy0) continue;
+    }
     int bandRowsFull = oyB - bandOy0 + 1;
     for (int sb = 0; sb < bandRowsFull; sb += 32) {   // v8.21: back to the v8.7 width
       mgBandOy0 = bandOy0 + sb;
@@ -1099,7 +1375,8 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
             if (mgStageUsed > (genPart->size - GEN_STAGE_OFF) - 131072) {
               mgFail = "stage full"; return false;
             }
-            ok = mgStageTile(z, tx, ty, "std") && mgStageTile(z, tx, ty, "blank");
+            ok = colour ? mgStageTile(z, tx, ty, "pale")
+              : (mgStageTile(z, tx, ty, "pale") && mgStageTile(z, tx, ty, "blank"));
           }
           // v6.5: if a staged record's chunk structure is broken,
           // hard-reset the connection and refetch the strip once.
@@ -1117,7 +1394,8 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
             }
             mgStageUsed = 0; mgStageCarryN = 0; mgRecCount = 0;
             for (int tx = txA; tx <= txB && ok; tx++) {
-              ok = mgStageTile(z, tx, ty, "std") && mgStageTile(z, tx, ty, "blank");
+              ok = colour ? mgStageTile(z, tx, ty, "pale")
+              : (mgStageTile(z, tx, ty, "pale") && mgStageTile(z, tx, ty, "blank"));
             }
             if (ok) for (int r2 = 0; r2 < mgRecCount; r2++) mgRecTy[r2] = ty;
             if (ok && !mgStripRecordsValid()) {   // v8.3: failed attempt
@@ -1129,9 +1407,9 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
             }
           }
         }
-        snprintf(l2, sizeof(l2), "map %d/2 rows %d/480 heap %u", mi + 1, mgBandOy0 + mgBandRows,
+        snprintf(l2, sizeof(l2), "rows %d/480 heap %u", mgBandOy0 + mgBandRows,
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-        mgShow(mi == 0 ? "APRS map (narrow area)" : "FLIGHT/AIS map (wide area)",
+        mgShow("Range map (all screens)",
                l2, (mgBandOy0 + mgBandRows) * 85 / 480);
         if (!ok) { mgFail = "tile fetch"; return false; }
         for (int r2 = 0; r2 < mgRecCount; r2++) mgRecTy[r2] = ty;   // v6.4
@@ -1140,16 +1418,58 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
         // v8.7: try the work set with the TLS session still up;
         // only if it does not fit, drop the session and retry
         // the allocation once (kept as a fallback).
-        if (!mgPrepWorkBuffers()) {
-          mgHttp.end(); mgTls.stop();
-          if (!mgPrepWorkBuffers()) return false;
+        if (colour) {   // v124: colour aggregates instead of the work carve
+          if (!mgAllocColourBuffers()) {
+            mgHttp.end(); mgTls.stop();
+            if (!mgAllocColourBuffers()) { mgFail = "heap (colour buffers)"; return false; }
+          }
+          memset(mgColR, 0, 160 * 32 * 2);
+          memset(mgColG, 0, 160 * 32 * 2);
+          memset(mgColB, 0, 160 * 32 * 2);
+          memset(mgColN, 0, 160 * 32);
+        } else {
+          if (!mgPrepWorkBuffers()) {
+            mgHttp.end(); mgTls.stop();
+            if (!mgPrepWorkBuffers()) return false;
+          }
+          memset(mgAggGray, 0xFF, 160 * mgBandRows);
+          memset(mgAggSea, 0, 160 * mgBandRows);
         }
-        memset(mgAggGray, 0xFF, 160 * mgBandRows);
-        memset(mgAggSea, 0, 160 * mgBandRows);
         for (int rec = 0; rec < mgRecCount; rec++) {
-          if (!mgDecodeStaged(rec, ty, (rec & 1) ? 1 : 0)) {
+          if (!mgDecodeStaged(rec, ty, colour ? 2 : ((rec & 1) ? 1 : 0))) {
             mgFail = "tile decode"; mgDumpRec = rec; return false;
           }
+        }
+        if (colour) {   // v124: emit this strip-band straight into
+          // the stored image (strips/bands are disjoint and the
+          // partition was erased, so every cell is written once).
+          // Stored byte-swapped, the form pushImage displays
+          // correctly on this unit (the v86 colour lesson).
+          for (int lo = 0; lo < mgBandRows; lo++) {
+            int oy = mgBandOy0 + lo;
+            uint16_t rowBuf[160];
+            uint16_t lastV = 0xFFFF;   // white, swap-invariant
+            for (int sx = 0; sx < 160; sx++) {
+              int ai = lo * 160 + sx;
+              uint8_t n = mgColN[ai];
+              uint16_t v;
+              if (n) {
+                int r = mgColR[ai] / n, g = mgColG[ai] / n, b2 = mgColB[ai] / n;
+                uint16_t std565 = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b2 >> 3));
+                v = (uint16_t)((std565 << 8) | (std565 >> 8));
+                lastV = v;
+              } else v = lastV;   // no sample: carry the left neighbour
+              rowBuf[sx] = v;
+            }
+            esp_partition_write(genPart, dataOff + ((uint32_t)oy * 640 + (uint32_t)sx0) * 2,
+                                rowBuf, 320);
+            const uint8_t* rb = (const uint8_t*)rowBuf;
+            for (int i = 0; i < 320; i++) mgImgSum += rb[i];
+          }
+          mgStagePrevUsed = mgStageUsed;   // v6.6: re-erase next strip
+          mgFreeWorkBuffers();
+          esp_task_wdt_reset();
+          continue;
         }
         // v6.9: merge this strip's columns into the flash scratch.
         // AND-safety: strips own disjoint column ranges, so each
@@ -1180,8 +1500,10 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
         esp_task_wdt_reset();
       }
     }
+    if (colour && oyB >= emittedY) emittedY = oyB + 1;   // v125
   }
 
+  if (colour) { *sumOut = mgImgSum; mgFreeWorkBuffers(); return true; }   // v124
   // ---- pass 2: classify + pack + store ----
   mgCkpt = ((uint32_t)(mi + 1) << 24) | 3;   // v8.6
   // v8.1: v7.1+ frees the work buffers at each strip end; pass 2
@@ -1189,11 +1511,15 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
   if (!mgPrepWorkBuffers()) return false;
   for (int i = 0; i < 13; i++) mgRingRow[i] = -1;
   uint32_t sum = 0;
+  uint32_t seaSum = 0;   // v123
   for (int r = 0; r < 480; r++) {
     esp_partition_read(genPart, GEN_SCR_GRAY + r * 640, mgGrayCur, 640);
-    uint8_t grayRow[320], classRow[80];
+    uint8_t grayRow[320], classRow[80], seaRow[80];
     memset(classRow, 0, sizeof(classRow));
+    memset(seaRow, 0, sizeof(seaRow));
     for (int x = 0; x < 640; x++) {
+      if (mgRingBit(mgRingSea50, r, x))   // v123: stored sea plane
+        seaRow[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
       bool ink = mgRingBit(mgRingInk, r, x);
       bool coast = ink && mgCoastAt(r, x);
       bool grown = false;
@@ -1206,45 +1532,70 @@ static bool __attribute__((noinline)) mgOneMap(int mi, const double b[4], int z,
         classRow[x >> 3] |= (uint8_t)(0x80 >> (x & 7));
       int g = mgGrayCur[x];
       if (grown) g = 110;
+      // v102: the v85 erase of non-coast ink is REMOVED - with the
+      // line-art style back on (borders wanted), it deleted exactly
+      // the municipal borders at generation time. And every pixel
+      // the ink aggregate classifies as ink is floored to gd <= 200
+      // below, so even the faintest municipal border lines survive
+      // the contrast stretch + 4-bit quantisation instead of
+      // washing out to paper (the on-device v101 report).
       int gd = 255 - (255 - g) * 16 / 10;
       if (gd < 0) gd = 0;
+      if (ink && gd > 200) gd = 200;   // v102: ink floor (see above)
       int nib = gd >> 4;
       if (x & 1) grayRow[x >> 1] |= (uint8_t)nib;
       else grayRow[x >> 1] = (uint8_t)(nib << 4);
     }
     esp_partition_write(genPart, dataOff + r * 320, grayRow, 320);
     esp_partition_write(genPart, dataOff + 153600 + r * 80, classRow, 80);
+    esp_partition_write(genPart, GEN_SEA_OFF + r * 80, seaRow, 80);   // v123 (slot 0; copied later)
     for (int i = 0; i < 320; i++) sum += grayRow[i];
     for (int i = 0; i < 80; i++) sum += classRow[i];
+    for (int i = 0; i < 80; i++) seaSum += seaRow[i];
     if ((r & 31) == 0) {
       mgShow("Classifying coastlines...", "", 85 + r * 15 / 480);
       esp_task_wdt_reset();
     }
   }
   *sumOut = sum;
+  mgSeaSum = seaSum;   // v123
   mgFreeWorkBuffers();   // v8.6: was kept allocated into the next
   // map, whose fetches then faced a resident 34 KB work set
   return true;
 }
 
-static bool __attribute__((noinline)) mgGenerate() {
+static bool __attribute__((noinline)) mgGenerateInner();
+// v162N wrapper: map generation wants the heap for itself.
+static bool mgGenerate() {
+  if (tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
+  bool ok = mgGenerateInner();
+  tlsReserveRetake();
+  return ok;
+}
+static bool __attribute__((noinline)) mgGenerateInner() {
   mgStagePrevUsed = 0;   // v6.6: full erase below covers the first strip
-  // Bounds relative to home, mirroring the Takamatsu layout of
-  // make_maps.py (map1 z11 narrow, map2 z10 wide).
-  static const double OFF[2][4] = {
-    { +0.2599, -0.4401, -0.9401, +0.8566 },   // APRS:   N S W E
-    { +1.0599, -0.4401, -0.7934, +0.9066 },   // FLIGHT: N S W E
-  };
-  // v8.18: back to the proven fixed layout (the v8.13 range-scaled
-  // geometry is removed together with the range condition below).
-  static const int ZS[2] = { 11, 10 };
+  // v103: ONE map matched to the setup receive range, shared by all
+  // three tabs (user request). The frame is the range circle's
+  // bounding square around home: half-extents in degrees from the
+  // range in km. It is generated once into slot 0 and copied into
+  // slot 1 below, so every existing two-slot reader (MODE_MAP, the
+  // AIS bounds, the sea mask) works unchanged.
+  double R = mgRangeKm();
+  double halfLat = R / 111.0;
+  double clat = cos(homeLat * M_PI / 180.0); if (clat < 0.2) clat = 0.2;
+  double halfLon = R / (111.0 * clat);
   double b[2][4];
   for (int i = 0; i < 2; i++) {
-    b[i][0] = homeLat + OFF[i][0];
-    b[i][1] = homeLat + OFF[i][1];
-    b[i][2] = homeLon + OFF[i][2];
-    b[i][3] = homeLon + OFF[i][3];
+    b[i][0] = homeLat + halfLat;
+    b[i][1] = homeLat - halfLat;
+    b[i][2] = homeLon - halfLon;
+    b[i][3] = homeLon + halfLon;
   }
+  // Tile zoom: smallest z whose source width reaches ~1500 px
+  // (about 2.3x downscale to 640), clamped to [9, 12].
+  int z1 = 9;
+  while (z1 < 12 && (b[0][3] - b[0][2]) * 256.0 * (1 << z1) / 360.0 < 1500.0) z1++;
+  int ZS[2] = { z1, z1 };
   // v6: the PNG decoder is allocated HERE - the config server is
   // stopped and no TLS session exists yet, the emptiest heap of the
   // boot (the standalone diagnostic reached GSI with ~110 KB free in
@@ -1268,12 +1619,14 @@ static bool __attribute__((noinline)) mgGenerate() {
     }
   }
   uint32_t sums[2] = { 0, 0 };
-  for (int i = 0; i < 2; i++)
-    if (!mgOneMap(i, b[i], ZS[i], GEN_HDR_BYTES + i * GEN_MAP_BYTES, &sums[i]))
-      return false;
+  // v124: generation now produces ONE stored colour image (GSI
+  // pale tiles, averaged to 640x480 RGB565). No slot copy - the
+  // colour renderer reads the single image for every screen.
+  if (!mgOneMap(0, b[0], ZS[0], GEN_HDR_BYTES, &sums[0], true)) return false;
+  sums[1] = sums[0];
   GenHeader h = {};
   h.magic = GEN_MAGIC;
-  h.ver = 1;
+  h.ver = 2;   // v124: colour image format
   h.homeLat = homeLat;
   h.homeLon = homeLon;
   memcpy(h.b, b, sizeof(b));
@@ -1316,12 +1669,14 @@ static bool mgActivate() {
   // the primary is unreadable.
   static GenHeader hdrS;
   mgHdrFromBackup = false;
+  genColorActive = false;
+  genColorPtr = nullptr;
   bool hdrOk = esp_partition_read(genPart, 0, &hdrS, sizeof(hdrS)) == ESP_OK
-               && hdrS.magic == GEN_MAGIC && hdrS.ver == 1;
+               && hdrS.magic == GEN_MAGIC && (hdrS.ver == 1 || hdrS.ver == 2);
   if (!hdrOk) {
     GenHeader bak;
     if (esp_partition_read(genPart, GEN_HDR_BYTES - sizeof(bak), &bak, sizeof(bak)) == ESP_OK
-        && bak.magic == GEN_MAGIC && bak.ver == 1) {
+        && bak.magic == GEN_MAGIC && (bak.ver == 1 || bak.ver == 2)) {
       hdrS = bak;
       mgHdrFromBackup = true;
       hdrOk = true;
@@ -1330,7 +1685,7 @@ static bool mgActivate() {
     }
   }
   const GenHeader* h = &hdrS;
-  if (h->magic != GEN_MAGIC || h->ver != 1) {
+  if (h->magic != GEN_MAGIC || (h->ver != 1 && h->ver != 2)) {
     snprintf(mgActFail, sizeof(mgActFail), "bad magic/ver %08x/%d",
              (unsigned)h->magic, (int)h->ver);
     Serial.printf("MAPGEN activate: %s\n", mgActFail);
@@ -1341,6 +1696,31 @@ static bool mgActivate() {
                     d0[0], d0[1], d0[2], d0[3], d0[4], d0[5], d0[6], d0[7],
                     dB[0], dB[1], dB[2], dB[3], dB[4], dB[5], dB[6], dB[7]); }
     return false;
+  }
+  if (h->ver == 2) {   // v124: stored colour image (GSI pale)
+    const uint8_t* img = genMapPtr + GEN_HDR_BYTES;
+    uint32_t s2 = 0;
+    for (int k = 0; k < 614400; k++) s2 += img[k];
+    if (s2 != h->sum[0]) {
+      snprintf(mgActFail, sizeof(mgActFail),
+               "colour image sum %u vs hdr %u", (unsigned)s2, (unsigned)h->sum[0]);
+      Serial.printf("MAPGEN activate: %s\n", mgActFail);
+      return false;
+    }
+    mgActFail[0] = 0;
+    genColorPtr = img;
+    genColorActive = true;
+    genSeaValid = false;
+    mgHdrRangeKm = h->reserved[0] ? (int)h->reserved[0] : 100;
+    for (int i = 0; i < 2; i++) {
+      MAP_LIST[i].north = h->b[0][0];
+      MAP_LIST[i].south = h->b[0][1];
+      MAP_LIST[i].west = h->b[0][2];
+      MAP_LIST[i].east = h->b[0][3];
+    }
+    genMapsActive = true;
+    Serial.println("MAPGEN: colour map active (GSI pale)");
+    return true;
   }
   // v8.20: the header centre is NOT compared with the settings any
   // more - changing the centre in the portal no longer triggers a
@@ -1358,6 +1738,24 @@ static bool mgActivate() {
     }
   }
   mgActFail[0] = 0;
+  // v123: stored sea plane (old headers carry no magic -> the
+  // renderer keeps using the geometric flood fill for those maps).
+  genSeaValid = false;
+  genSeaPtr[0] = genSeaPtr[1] = nullptr;
+  if (h->reserved[1] == GEN_SEA_MAGIC) {
+    const uint8_t* sp = genMapPtr + GEN_SEA_OFF;
+    uint32_t s2 = 0;
+    for (int k = 0; k < GEN_SEA_BYTES; k++) s2 += sp[k];
+    if (s2 == h->reserved[2]) {
+      genSeaValid = true;
+      genSeaPtr[0] = genMapPtr + GEN_SEA_OFF;
+      genSeaPtr[1] = genMapPtr + GEN_SEA_OFF + GEN_SEA_BYTES;
+      Serial.println("MAPGEN: stored sea plane OK (GSI pale)");
+    } else {
+      Serial.printf("MAPGEN: sea plane sum mismatch %u vs %u - ignored\n",
+                    (unsigned)s2, (unsigned)h->reserved[2]);
+    }
+  }
   mgHdrRangeKm = h->reserved[0] ? (int)h->reserved[0] : 100;   // v8.13
   for (int i = 0; i < 2; i++) {
     mapGrayPtr[i] = genMapPtr + GEN_HDR_BYTES + i * GEN_MAP_BYTES;
@@ -1395,7 +1793,7 @@ static bool mgAllocWorkBuffers() {
   // The 20 KB of RAM row accumulators (v6.6-v6.8) never fit the
   // heap alongside the live TLS session + pngle, in any arrangement.
   if (!mgSeaBits) mgSeaBits = (uint8_t*)heap_caps_malloc(8192, MALLOC_CAP_DMA);
-  if (!mgWork) mgWork = (uint8_t*)heap_caps_malloc(5760, MALLOC_CAP_DMA);
+  if (!mgWork) mgWork = (uint8_t*)heap_caps_malloc(6800, MALLOC_CAP_DMA);   // v123: 5760 + sea50 ring
   if (!mgAggGray) mgAggGray = (uint8_t*)heap_caps_malloc(160 * 32, MALLOC_CAP_DMA);
   if (!mgAggSea) mgAggSea = (uint8_t*)heap_caps_malloc(160 * 32, MALLOC_CAP_DMA);
   return mgAggGray && mgAggSea && mgSeaBits && mgWork;
@@ -1405,9 +1803,20 @@ static bool mgAllocWorkBuffers() {
 // "pngle only" state for TLS handshakes - with the 32-row
 // aggregates resident (24 KB), a retry handshake after a dropped
 // connection failed with http -1 (v7.0, tiles 14).
+static bool mgAllocColourBuffers() {   // v124
+  if (!mgColR) mgColR = (uint16_t*)heap_caps_malloc(160 * 32 * 2, MALLOC_CAP_DMA);
+  if (!mgColG) mgColG = (uint16_t*)heap_caps_malloc(160 * 32 * 2, MALLOC_CAP_DMA);
+  if (!mgColB) mgColB = (uint16_t*)heap_caps_malloc(160 * 32 * 2, MALLOC_CAP_DMA);
+  if (!mgColN) mgColN = (uint8_t*)heap_caps_malloc(160 * 32, MALLOC_CAP_DMA);
+  return mgColR && mgColG && mgColB && mgColN;
+}
 static void mgFreeWorkBuffers() {
   if (mgAggGray) { free(mgAggGray); mgAggGray = nullptr; }
   if (mgAggSea) { free(mgAggSea); mgAggSea = nullptr; }
+  if (mgColR) { free(mgColR); mgColR = nullptr; }
+  if (mgColG) { free(mgColG); mgColG = nullptr; }
+  if (mgColB) { free(mgColB); mgColB = nullptr; }
+  if (mgColN) { free(mgColN); mgColN = nullptr; }
   if (mgSeaBits) { free(mgSeaBits); mgSeaBits = nullptr; }
   if (mgWork) { free(mgWork); mgWork = nullptr; }
 }
@@ -1437,7 +1846,7 @@ static void mgDumpFailed() {
     }
   }
   Serial.printf("DUMP rec%d %s tx%d ty%d len%u crc %08x\n",
-                rec, mgRecLayer[rec] ? "blank" : "std",
+                rec, mgRecLayer[rec] ? "blank" : "pale",
                 mgRecTx[rec], mgRecTy[rec], (unsigned)len, (unsigned)crc);
   static const char B64[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1466,9 +1875,9 @@ static void mgDumpFailed() {
 static void mgDiagMaybeShow() {
   GenHeader hp = {}, hb = {};
   bool pOk = genPart && esp_partition_read(genPart, 0, &hp, sizeof(hp)) == ESP_OK
-             && hp.magic == GEN_MAGIC && hp.ver == 1;
+             && hp.magic == GEN_MAGIC && (hp.ver == 1 || hp.ver == 2);   // v126: ver2 colour headers are healthy
   bool bOk = genPart && esp_partition_read(genPart, GEN_HDR_BYTES - sizeof(hb), &hb, sizeof(hb)) == ESP_OK
-             && hb.magic == GEN_MAGIC && hb.ver == 1;
+             && hb.magic == GEN_MAGIC && (hb.ver == 1 || hb.ver == 2);   // v126
   char lgf[64] = "", laf[64] = "";
   { Preferences p;
     if (p.begin("aprsmap", true)) {
@@ -1582,7 +1991,7 @@ static void __attribute__((noinline)) mapGenBoot() {
       }
       mgShow(fl, fl2, 0);
       // v5.10: keep the diagnosis on screen until the screen is
-      // touched (028 port: a touch press instead of the M5 buttons)
+      // touched (024 port: a touch press instead of the M5 buttons)
       uint32_t ft0 = millis();
       while (millis() - ft0 < 120000) {
         touchRoute();
@@ -1602,17 +2011,20 @@ static void computeView() {
   const BmpInfo& bi = bmpInfo[curMap];
   int w = bi.ok ? bi.w : 320;
   int h = bi.ok ? bi.h : 240;
-  double fit = min(320.0 / w, 240.0 / h);
-  double s;
-  if (curMap == 0) {   // APRS screen zoom table (user request)
-    static const double APRS_SCALES[7] = {0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5};
-    int li = zoomLevel; if (li < 0) li = 0; if (li > 6) li = 6;
-    s = APRS_SCALES[li];
-  } else {             // Flight screen: doubling zoom
-    s = fit;
-    for (int i = 0; i < zoomLevel; i++) s *= 2;
-    if (s > 4.0) s = 4.0;
-  }
+  // v116: ONE zoom table for all screens - the map was unified in
+  // v103, and the user expects the display (zoom steps and scale
+  // labels) to be identical on APRS / FLIGHT / AIS too. Before, the
+  // Flight fit view labelled itself "x0.5" while AIS called the
+  // same view "x1", and the levels were remembered per screen.
+  // v117: TWO zoom steps only (user request): x0.5 (whole map)
+  // and x1.0. The 7-step cycle never landed him on x0.5 in
+  // practice; a plain toggle between the two views is clearer.
+  // v171N: FOUR steps again (user request): x0.5 / x1.0 / x1.5 /
+  // x2.0, driven by the [-] [+] buttons (the v117 two-step ZOOM
+  // toggle is retired).
+  static const double APRS_SCALES[4] = {0.5, 1.0, 1.5, 2.0};
+  int li = zoomLevel; if (li < 0) li = 0; if (li > 3) li = 3;
+  double s = APRS_SCALES[li];
   vScale = s;
   vSrcW = 320.0 / s; if (vSrcW > w) vSrcW = w;
   vSrcH = 240.0 / s; if (vSrcH > h) vSrcH = h;
@@ -1647,12 +2059,12 @@ static bool geoToPx(double lat, double lon, int& px, int& py) {
 }
 
 // Startup/reset zoom: the whole map fitted to the screen (level 0), so
-// map1 (all of Kagawa) is what you see first. Zoom in with [+] / station taps.
+// the whole map is what you see first. Zoom in with [+] / station taps.
 static int maxZoomLevel() {
-  return screenMode == 0 ? 6 : 3;   // APRS has 7 levels (x0.5..x3.5), Flight 4
+  return 3;   // v171N: four steps (x0.5 .. x2.0)
 }
 static int defaultZoomLevel() {
-  return screenMode == 0 ? 1 : 0;   // APRS opens at x1, Flight at the fit view
+  return 0;   // v171N: every screen opens at x0.5 (user request)
 }
 
 static uint16_t rowPixBuf[320];
@@ -1675,6 +2087,12 @@ static int vImgRows = 0, vImgCols = 0;
 static int tapX = -1, tapY = -1;       // last registered tap (marker)
 static uint32_t tapMs = 0;
 static bool tapShown = false;
+// v112: a press captured while a full map render is running (the
+// render blocks loop() for ~500 ms and presses that started and
+// ended inside it were lost - "touch takes a long time to respond").
+static bool pendingTap = false;
+static int pendingTapX = 0, pendingTapY = 0;
+static void captureTouchDuringRender();   // defined by touchLoop
 
 // (mapChunk is declared with the aircraft globals - fetchAircraft frees it)
 static int chunkY0 = 0, chunkRows = 0;
@@ -1707,34 +2125,429 @@ static inline bool mapCoastAt(int sx, int sy) {
   return (mapClassPtr[curMap][i >> 3] >> (7 - (i & 7))) & 1;
 }
 
-// Dark theme palettes by line class (user request): coastlines white,
-// borders green; both ramp from the near-black background.
-static uint16_t inkPalW[256];
-static uint16_t inkPalG[256];
-static bool inkPalInit = false;
-// pushImage colour rotation on this unit (diagnosed 2026-11-08 from
-// two test photos): pushed (r,g,b) displays as (g,b,r) - red shows
-// cyan, green shows red, blue shows green; white/black invariant.
-// Both palettes below are packed pre-rotated - (b, r, g) - so the
-// map displays in the intended colours.
-static void initInkPal() {
-  for (int d = 0; d < 256; d++) {
-    // Coastline white: quick brightness rise (thin lines reach near-
-    // white), NEUTRAL ramp. (A warm cast added in v52 against the
-    // old cyan report became unnecessary once the pushImage colour
-    // rotation was fixed in v56, and on the thinned v59 line its
-    // mid-tones read as pink - user report.)
-    int wd = (int)(255.0f * powf(d / 255.0f, 0.65f));
-    int r = 10 + wd * (255 - 10) / 255;
-    int g = 12 + wd * (255 - 12) / 255;
-    int b = 16 + wd * (255 - 16) / 255;
-    inkPalW[d] = (uint16_t)(((b & 0xF8) << 8) | ((r & 0xFC) << 3) | (g >> 3));  // pre-rotated (see above)
-    int gr = 10 - d * 10 / 255;
-    int gg = 12 + d * (215 - 12) / 255;
-    int gb = 16 - d * 16 / 255;
-    inkPalG[d] = (uint16_t)(((gb & 0xF8) << 8) | ((gr & 0xFC) << 3) | (gg >> 3));  // pre-rotated
+// v87 map style (user request): no line art; the sea is a flat
+// pale-blue fill and the land stays black. The stored maps carry
+// NO sea tone to key on: generated maps are classified from GSI
+// "blank" tiles, whose sea is paper-white exactly like the land
+// (measured on-device by the map diag, 2026-11-17: active GEN map0
+// is 99% paper in class 0), and the sea bits gathered during
+// generation are discarded after the coast classification. So the
+// sea is recovered geometrically: a scanline flood fill from the
+// map edges over the paper, walled by everything that is not
+// paper (g < 240: line cores, anti-aliasing and the coast-class
+// shoulder - the same barrier rule that was verified offline on
+// the baked blank-map data: 65% / 43% sea, no leaks). The fill
+// runs once per map/source change; the renderer then only tests
+// the mask - pale blue inside, black outside.
+static const uint16_t SEA_BLUE = (uint16_t)__builtin_bswap16(
+    (uint16_t)(((80 & 0xF8) << 8) | ((115 & 0xFC) << 3) | (145 >> 3)));
+// v167N: sea darkened to ~60% (135,190,235 -> 80,115,145) - the
+// pale sea was what made the whole map read bright (user).
+// v90 boot-stage marker (RTC memory survives a panic reboot):
+// the splash shows where the previous boot died.
+
+static uint8_t* seaMask = nullptr;          // 640x480 bits
+static int seaMaskMap = -1;
+static const uint8_t* seaMaskSrc = nullptr;
+static int seaMaskFailMap = -1;             // v88: build-failure latch -
+static const uint8_t* seaMaskFailSrc = nullptr;  // never retry per frame
+
+// v97: inland line art (municipal / prefectural borders, rivers - any
+// ink that is not coastline class) renders as line art on the black
+// land. Coast-class ink stays black so the blue sea edge stays crisp.
+// v101: the line colour is the pre-v83 border GREEN (0,215,0) - white
+// read too faint on this panel (user report). Stored byte-swapped
+// like SEA_BLUE, for the 024 pushImage path.
+static const uint16_t BORDER_GREEN = 0x4005;   // v167N: (0,170,0) dimmed with the sea, byte-swapped
+static inline bool seaMaskBit(int sx, int sy);   // defined just below
+static inline bool seaNearAt(int sx, int sy) {
+  if (!seaMask) return false;
+  for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+      if (seaMaskBit(sx + dx, sy + dy)) return true;
+  return false;
+}
+static inline bool inkLineAt(int sx, int sy) {   // unthinned line eligibility
+  int g = mapGrayAt(sx, sy);
+  if (g >= 240) return false;
+  // v110: line ink only. The generation contrast stretch pulls the
+  // blank tiles' light area tints (residential / park fills, source
+  // gray 191-245) down into the 153-239 range; drawing those green
+  // made the borders look massively thick (user report). True line
+  // cores sit at nibble <=8 (gray <=136); tints fall through to the
+  // black land ramp in mapPixelAt.
+  if (g >= 153) return false;
+  if (!mapCoastAt(sx, sy)) return true;
+  // v108: coast-CLASS ink far from the real sea is a border / river
+  // line misclassified at generation time - inland water (irrigation
+  // ponds, rivers) puts 'sea' bits all over the plain, so
+  // most plain borders came out coast-class and were drawn black.
+  // Only ink actually touching the sea mask is a true coastline:
+  // keep that black, draw the rest green. Render-side only.
+  return !seaNearAt(sx, sy);
+}
+static inline bool inkWhiteAt(int sx, int sy) {
+  if (!inkLineAt(sx, sy)) return false;
+  // v121: thinning (user: municipal borders still too thick). A
+  // stored line is a dark core plus the generation grown ring -
+  // 3-4 px wide. Keep only its upper-left contour: a pixel with
+  // line ink both above and left of it is interior and drops out.
+  // Host-validated: green pixels halve, lines stay continuous at
+  // x1 and at the x0.5 box downscale.
+  bool up = sy > 0 && inkLineAt(sx, sy - 1);
+  bool lf = sx > 0 && inkLineAt(sx - 1, sy);
+  return !(up && lf);
+}
+
+static inline bool seaMaskBit(int sx, int sy) {
+  if (!seaMask) return false;
+  if (sx < 0) sx = 0; if (sx >= MAP_W) sx = MAP_W - 1;
+  if (sy < 0) sy = 0; if (sy >= MAP_H) sy = MAP_H - 1;
+  int i = sy * MAP_W + sx;
+  return (seaMask[i >> 3] >> (7 - (i & 7))) & 1;
+}
+
+struct SeaDecision { int16_t x, y, minx, maxx, miny, maxy; bool sea; };
+static SeaDecision seaDecisions[512];   // v120: room for interior cells too
+static int seaDecisionCount = 0;
+
+static void buildSeaMask(int mi) {
+  // v98/v100: a paper region counts as sea only if it touches the map
+  // edge AND (almost) all of its ink boundary is coastline class.
+  // Plain edge seeding also flooded edge-touching LAND (the
+  // neighbouring prefecture cut off by the map frame turned blue -
+  // user report); a prefecture cell is bounded largely by border ink
+  // and fails the >=90% coast test, while a true sea cell's ink
+  // boundary is coastline by construction. Host-validated on the
+  // baked maps (sea cells 94-100% coast, land cells <=69%).
+  // v100 memory layout: the DMA-capable heap fits only TWO 38,400 B
+  // bitplanes at build time (v98's third one failed on device), so
+  // phase 1 decides the edge cells into a scratch plane and records
+  // the verdicts, then phase 2 replays the accepted cells into the
+  // mask. The fill stack is word-accessed only, so it may sit in any
+  // heap region (plain INTERNAL caps). Byte-accessed planes use
+  // MALLOC_CAP_DMA so they can never land in the byte-load-faulting
+  // leftover-IRAM region (the v87-v95 boot panic).
+  Serial.printf("sea mask build start map %d (heap %u)\n", mi, (unsigned)ESP.getFreeHeap());
+  uint8_t* blocked = (uint8_t*)heap_caps_malloc(38400, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  if (!blocked) { seaMaskFailMap = mi; seaMaskFailSrc = mapGrayPtr[mi]; Serial.println("sea mask: blocked alloc failed"); return; }
+  memset(blocked, 0, 38400);
+  uint8_t* visited = (uint8_t*)heap_caps_malloc(38400, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  if (!visited) { free(blocked); seaMaskFailMap = mi; seaMaskFailSrc = mapGrayPtr[mi]; Serial.println("sea mask: visited alloc failed"); return; }
+  memset(visited, 0, 38400);
+  int32_t* seaStack = (int32_t*)heap_caps_malloc(4096 * 4, MALLOC_CAP_INTERNAL);
+  if (!seaStack) { free(visited); free(blocked); seaMaskFailMap = mi; seaMaskFailSrc = mapGrayPtr[mi]; Serial.println("sea mask: stack alloc failed"); return; }
+  int saved = curMap; curMap = mi;
+  for (int y = 0; y < MAP_H; y++) {
+    if ((y & 63) == 0) esp_task_wdt_reset();
+    for (int x = 0; x < MAP_W; x++) {
+      if (mapGrayAt(x, y) < 240) {
+        int i = y * MAP_W + x;
+        blocked[i >> 3] |= (uint8_t)(0x80 >> (i & 7));
+      }
+    }
   }
-  inkPalInit = true;
+  auto bitAt = [](const uint8_t* p, int x, int y) -> bool {
+    int i = y * MAP_W + x;
+    return (p[i >> 3] >> (7 - (i & 7))) & 1;
+  };
+  auto blk = [&](int x, int y) -> bool {   // barrier ink
+    if (x < 0 || x >= MAP_W || y < 0 || y >= MAP_H) return true;
+    return bitAt(blocked, x, y);
+  };
+  uint8_t* fillTarget = visited;
+  bool doTally = false;
+  long cellN = 0, tallyInk = 0, tallyCoast = 0;
+  int cellMinX = 0, cellMaxX = -1, cellMinY = 0, cellMaxY = -1;
+  auto setCell = [&](int x, int y) {
+    int i = y * MAP_W + x;
+    fillTarget[i >> 3] |= (uint8_t)(0x80 >> (i & 7));
+    if (x < cellMinX) cellMinX = x;
+    if (x > cellMaxX) cellMaxX = x;
+    if (y < cellMinY) cellMinY = y;
+    if (y > cellMaxY) cellMaxY = y;
+    if (!doTally) return;
+    cellN++;
+    static const int dx4[4] = { 1, -1, 0, 0 }, dy4[4] = { 0, 0, 1, -1 };
+    for (int d = 0; d < 4; d++) {
+      int nx = x + dx4[d], ny = y + dy4[d];
+      if (nx < 0 || nx >= MAP_W || ny < 0 || ny >= MAP_H) continue;
+      if (mapGrayAt(nx, ny) < 240) { tallyInk++; if (mapCoastAt(nx, ny)) tallyCoast++; }
+    }
+  };
+  auto filled = [&](int x, int y) -> bool {
+    return bitAt(fillTarget, x, y) || blk(x, y);
+  };
+  // Stepping horizontally/vertically across a corner where the two
+  // diagonal neighbours are both barrier would leak through an
+  // 8-connected ink chain; the squeeze tests close those corners
+  // without dilating the barrier (narrow straits stay open).
+  auto squeezeH = [&](int x, int y, int dx) -> bool {
+    return (blk(x + dx, y - 1) && blk(x, y + 1)) || (blk(x + dx, y + 1) && blk(x, y - 1));
+  };
+  auto squeezeV = [&](int x, int y, int ny) -> bool {
+    return (blk(x - 1, ny) && blk(x + 1, y)) || (blk(x + 1, ny) && blk(x - 1, y));
+  };
+  int sp = 0;
+  auto push = [&](int sx, int sy) { if (sp < 4096) seaStack[sp++] = (int32_t)((sy << 10) | sx); };
+  auto fillFromStack = [&]() {
+    while (sp > 0) {
+      int32_t v = seaStack[--sp];
+      int x = v & 1023, y = v >> 10;
+      if (filled(x, y)) continue;
+      int lx = x;
+      while (lx > 0 && !filled(lx - 1, y) && !squeezeH(lx, y, -1)) lx--;
+      int rx = x;
+      while (rx < MAP_W - 1 && !filled(rx + 1, y) && !squeezeH(rx, y, +1)) rx++;
+      for (int i = lx; i <= rx; i++) setCell(i, y);
+      for (int dy = -1; dy <= 1; dy += 2) {
+        int ny = y + dy;
+        if (ny < 0 || ny >= MAP_H) continue;
+        int i = lx;
+        while (i <= rx) {
+          while (i <= rx && (filled(i, ny) || squeezeV(i, y, ny))) i++;
+          if (i > rx) break;
+          push(i, ny);
+          while (i <= rx && !filled(i, ny)) i++;
+        }
+      }
+    }
+  };
+  auto fillCell = [&](int sx, int sy, bool tally) {
+    doTally = tally;
+    cellN = 0; tallyInk = 0; tallyCoast = 0;
+    cellMinX = MAP_W; cellMaxX = -1; cellMinY = MAP_H; cellMaxY = -1;
+    sp = 0;
+    push(sx, sy);
+    fillFromStack();
+  };
+  // Phase 1: decide every edge-touching paper cell.
+  seaDecisionCount = 0;
+  auto decide = [&](int sx, int sy) {
+    fillCell(sx, sy, true);
+    if (cellN == 0) return;
+    // v108: 80% (was 90%). v111: 72% - the user's own serial log of
+    // his generated 50 km map (2026-11-17) showed his stored data
+    // fragments the northern sea into small cells scoring 74.7-78.8%
+    // (island chains cut the water up; on-device classification runs
+    // coarser than the host replication, which saw one 89% cell),
+    // while every true-land edge cell scored <=68.2%. 72% sits in
+    // the measured gap; baked-map land cells (<=69%) stay land too.
+    bool sea = (tallyInk == 0) || (tallyCoast * 25 >= tallyInk * 18);
+    if (cellN >= 3 && seaDecisionCount < 512) {
+      seaDecisions[seaDecisionCount++] = SeaDecision{
+        (int16_t)sx, (int16_t)sy, (int16_t)cellMinX, (int16_t)cellMaxX,
+        (int16_t)cellMinY, (int16_t)cellMaxY, sea };
+      Serial.printf("sea mask: cell (%d,%d) %ld px, ink %ld coast %ld -> %s\n",
+                    sx, sy, cellN, tallyInk, tallyCoast, sea ? "SEA" : "land");
+    }
+  };
+  for (int x = 0; x < MAP_W; x++) {
+    if (!blk(x, 0) && !bitAt(visited, x, 0)) decide(x, 0);
+    if (!blk(x, MAP_H - 1) && !bitAt(visited, x, MAP_H - 1)) decide(x, MAP_H - 1);
+  }
+  for (int y = 0; y < MAP_H; y++) {
+    if (!blk(0, y) && !bitAt(visited, 0, y)) decide(0, y);
+    if (!blk(MAP_W - 1, y) && !bitAt(visited, MAP_W - 1, y)) decide(MAP_W - 1, y);
+  }
+  free(visited);
+  // Phase 2: replay the accepted cells into the real mask.
+  if (!seaMask) seaMask = (uint8_t*)heap_caps_malloc(38400, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  if (!seaMask) { free(seaStack); free(blocked); curMap = saved; seaMaskFailMap = mi; seaMaskFailSrc = mapGrayPtr[mi]; Serial.println("sea mask: mask alloc failed"); return; }
+  memset(seaMask, 0, 38400);
+  fillTarget = seaMask;
+  for (int d = 0; d < seaDecisionCount; d++)
+    if (seaDecisions[d].sea) fillCell(seaDecisions[d].x, seaDecisions[d].y, false);
+  // v122 phase 2.5: interior pockets EMBEDDED in confirmed sea.
+  // v120 decided interior cells by tally+size alone and flipped
+  // inland ponds / valley pockets to sea (user photo: blue blobs
+  // all over the plain). A true island pocket sits within a few
+  // px of confirmed sea (only island ink between); an inland pond
+  // has no sea anywhere near its bbox. Test: any seaMask pixel
+  // within the cell bbox expanded by 5 px.
+  {
+    uint8_t* done = (uint8_t*)heap_caps_malloc(38400, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!done) {
+      Serial.println("sea mask: pocket pass skipped (alloc failed)");
+    } else {
+      memset(done, 0, 38400);
+      for (int y = 0; y < MAP_H; y++)
+        for (int x = 0; x < MAP_W; x++)
+          if (blk(x, y) || seaMaskBit(x, y)) {
+            int i = y * MAP_W + x;
+            done[i >> 3] |= (uint8_t)(0x80 >> (i & 7));
+          }
+      fillTarget = done;
+      for (int y = 0; y < MAP_H; y++) {
+        if ((y & 63) == 0) esp_task_wdt_reset();
+        for (int x = 0; x < MAP_W; x++) {
+          if (blk(x, y) || bitAt(done, x, y)) continue;
+          fillCell(x, y, true);
+          if (cellN < 3 || cellN > 700) continue;
+          bool verdict = (tallyInk == 0) || (tallyCoast * 25 >= tallyInk * 18);
+          if (!verdict) continue;
+          int bx0 = cellMinX > 5 ? cellMinX - 5 : 0, bx1 = cellMaxX < MAP_W - 6 ? cellMaxX + 5 : MAP_W - 1;
+          int by0 = cellMinY > 5 ? cellMinY - 5 : 0, by1 = cellMaxY < MAP_H - 6 ? cellMaxY + 5 : MAP_H - 1;
+          bool embedded = false;
+          for (int yy = by0; yy <= by1 && !embedded; yy++)
+            for (int xx = bx0; xx <= bx1; xx++)
+              if (seaMaskBit(xx, yy)) { embedded = true; break; }
+          Serial.printf("sea mask: pocket (%d,%d) %ld px -> %s\n",
+                        x, y, cellN, embedded ? "SEA" : "inland, stays land");
+          if (embedded) {
+            fillTarget = seaMask;
+            fillCell(x, y, false);
+            fillTarget = done;
+          }
+        }
+      }
+      free(done);
+      fillTarget = seaMask;
+    }
+  }
+  // Repair: pockets a stack overflow left inside an accepted cell
+  // (bbox-tested so rejected land cells can never leak in).
+  auto inBBox = [&](int x, int y, bool sea) -> bool {
+    for (int d = 0; d < seaDecisionCount; d++) {
+      if (seaDecisions[d].sea != sea) continue;
+      if (x >= seaDecisions[d].minx && x <= seaDecisions[d].maxx &&
+          y >= seaDecisions[d].miny && y <= seaDecisions[d].maxy) return true;
+    }
+    return false;
+  };
+  for (int round = 0; round < 3; round++) {
+    bool any = false;
+    for (int y = 0; y < MAP_H; y++) {
+      if ((y & 63) == 0) esp_task_wdt_reset();
+      for (int x = 0; x < MAP_W; x++) {
+        if (blk(x, y) || bitAt(seaMask, x, y)) continue;
+        if (!((x > 0 && bitAt(seaMask, x - 1, y)) || (x < MAP_W - 1 && bitAt(seaMask, x + 1, y)) ||
+              (y > 0 && bitAt(seaMask, x, y - 1)) || (y < MAP_H - 1 && bitAt(seaMask, x, y + 1)))) continue;
+        if (!inBBox(x, y, true) || inBBox(x, y, false)) continue;
+        fillCell(x, y, false);
+        any = true;
+      }
+    }
+    if (!any) break;
+  }
+  free(seaStack);
+  free(blocked);
+  curMap = saved;
+  seaMaskMap = mi;
+  seaMaskSrc = mapGrayPtr[mi];
+  uint32_t nSea = 0;
+  for (int i = 0; i < 38400; i++) nSea += __builtin_popcount(seaMask[i]);
+  Serial.printf("sea mask map %d: %u px (%u%%)\n", mi, (unsigned)nSea, (unsigned)(nSea * 100 / 307200));
+}
+
+static void ensureSeaMask() {
+  if (genColorActive) return;   // v124: the stored image IS the map
+  if (seaMaskMap == curMap && seaMaskSrc == mapGrayPtr[curMap]) return;
+  // v112: when both map slots hold identical data (the unified
+  // range map is copied into slot 1 at generation time), reuse the
+  // other slot's mask instead of rebuilding for seconds - tab
+  // switches stay instant.
+  if (seaMask && seaMaskMap >= 0 && seaMaskMap != curMap &&
+      seaMaskSrc == mapGrayPtr[seaMaskMap] &&
+      !memcmp(mapGrayPtr[0], mapGrayPtr[1], 153600) &&
+      !memcmp(mapClassPtr[0], mapClassPtr[1], 38400)) {
+    seaMaskMap = curMap;
+    seaMaskSrc = mapGrayPtr[curMap];
+    Serial.println("sea mask: copied from twin slot");
+    return;
+  }
+  if (seaMaskFailMap == curMap && seaMaskFailSrc == mapGrayPtr[curMap]) return;
+  // v123: a generated map with a stored sea plane needs no flood
+  // fill at all - the mask is copied straight from flash.
+  if (genMapsActive && genSeaValid && genSeaPtr[curMap]) {
+    if (!seaMask)
+      seaMask = (uint8_t*)heap_caps_malloc(38400, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (seaMask) {
+      memcpy(seaMask, genSeaPtr[curMap], 38400);
+      seaMaskMap = curMap;
+      seaMaskSrc = mapGrayPtr[curMap];
+      Serial.println("sea mask: stored GSI sea plane");
+      return;
+    }
+  }
+  buildSeaMask(curMap);
+}
+
+// v124: stored colour image helpers. Stored pixels are
+// byte-swapped RGB565 (the form pushImage displays correctly).
+static inline void colorUnpack(uint16_t stored, int& r, int& g, int& b) {
+  uint16_t v = (uint16_t)((stored << 8) | (stored >> 8));
+  r = ((v >> 11) & 31) << 3;
+  g = ((v >> 5) & 63) << 2;
+  b = (v & 31) << 3;
+}
+static inline uint16_t colorPack(int r, int g, int b) {
+  uint16_t v = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+  return (uint16_t)((v << 8) | (v >> 8));
+}
+static inline uint16_t colorPxStored(int sx, int sy) {
+  uint16_t v;
+  memcpy(&v, genColorPtr + ((sy * 640) + sx) * 2, 2);
+  return v;
+}
+
+// v128: colour sampling in IMAGE coordinates. v124 put this
+// logic only in mapPixelAt - but the full-frame renderer drawMap
+// has its own inline sea/ink pixel logic and never calls
+// mapPixelAt (only restoreMapRect does), so the colour map
+// activated yet never appeared. Both paths now share this.
+// v168N: the unit is in COLOUR mode (stored ver=2 GSI pale map) -
+// the pale tiles are white-based, which is what reads bright.
+// Dim the sampled colour at render time; stored data untouched.
+static const double MAP_DIM = 0.65;
+// v169N: deepen the sea. GSI pale water is blue-dominant
+// (b > g > r with a wide b-r gap, ~181,209,237); land whites and
+// tints are near-neutral or warm/green, so the test is safe.
+// Water pixels take per-channel factors (deeper, more saturated)
+// instead of the flat MAP_DIM.
+static inline bool isSeaColor(int r, int g, int b) {
+  return b > g + 8 && g > r + 8 && b - r > 30;
+}
+static uint16_t colorAt(int ix, int iy) {
+    if (vScale > 1.0) {
+      double srcYf = vRectY0 + iy / vScale;
+      int sy0 = (int)srcYf; if (sy0 < 0) sy0 = 0; if (sy0 >= MAP_H) sy0 = MAP_H - 1;
+      int sy1 = min(sy0 + 1, MAP_H - 1);
+      double fy = srcYf - floor(srcYf); if (fy < 0) fy = 0;
+      double srcXf = vRectX0 + ix / vScale;
+      int sx0 = (int)srcXf; if (sx0 < 0) sx0 = 0; if (sx0 >= MAP_W) sx0 = MAP_W - 1;
+      int sx1 = min(sx0 + 1, MAP_W - 1);
+      double fx = srcXf - floor(srcXf); if (fx < 0) fx = 0;
+      int r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
+      colorUnpack(colorPxStored(sx0, sy0), r00, g00, b00);
+      colorUnpack(colorPxStored(sx1, sy0), r10, g10, b10);
+      colorUnpack(colorPxStored(sx0, sy1), r01, g01, b01);
+      colorUnpack(colorPxStored(sx1, sy1), r11, g11, b11);
+      double rr = r00 * (1 - fx) * (1 - fy) + r10 * fx * (1 - fy) + r01 * (1 - fx) * fy + r11 * fx * fy;
+      double gg = g00 * (1 - fx) * (1 - fy) + g10 * fx * (1 - fy) + g01 * (1 - fx) * fy + g11 * fx * fy;
+      double bb = b00 * (1 - fx) * (1 - fy) + b10 * fx * (1 - fy) + b01 * (1 - fx) * fy + b11 * fx * fy;
+      if (isSeaColor((int)rr, (int)gg, (int)bb))
+        return colorPack((int)(rr * 0.42 + 0.5), (int)(gg * 0.68 + 0.5), (int)(bb * 0.85 + 0.5));
+      return colorPack((int)(rr * MAP_DIM + 0.5), (int)(gg * MAP_DIM + 0.5), (int)(bb * MAP_DIM + 0.5));
+    }
+    int ys = (int)(vRectY0 + iy / vScale); if (ys < 0) ys = 0; if (ys >= MAP_H) ys = MAP_H - 1;
+    int ye = (int)(vRectY0 + (iy + 1) / vScale); if (ye <= ys) ye = ys + 1; if (ye > MAP_H) ye = MAP_H;
+    int xs = (int)(vRectX0 + ix / vScale); if (xs < 0) xs = 0; if (xs >= MAP_W) xs = MAP_W - 1;
+    int xe = (int)(vRectX0 + (ix + 1) / vScale); if (xe <= xs) xe = xs + 1; if (xe > MAP_W) xe = MAP_W;
+    long rs = 0, gs = 0, bs = 0; int cnt = 0;
+    for (int sy = ys; sy < ye; sy++)
+      for (int sx = xs; sx < xe; sx++) {
+        int r, g, b;
+        colorUnpack(colorPxStored(sx, sy), r, g, b);
+        rs += r; gs += g; bs += b; cnt++;
+      }
+    if (!cnt) return 0;
+    {
+      int ar = (int)(rs / cnt), ag = (int)(gs / cnt), ab = (int)(bs / cnt);
+      if (isSeaColor(ar, ag, ab))
+        return colorPack((int)(ar * 0.42), (int)(ag * 0.68), (int)(ab * 0.85));
+      return colorPack((int)(ar * MAP_DIM), (int)(ag * MAP_DIM), (int)(ab * MAP_DIM));
+    }
 }
 
 // Colour of one screen pixel of the bare map (no stations, no bar).
@@ -1743,6 +2556,7 @@ static uint16_t mapPixelAt(int x, int y) {
   if (iy < 0 || iy >= vImgRows) return 0;
   int ix = x - vXOff;
   if (ix < 0 || ix >= vImgCols) return 0;
+  if (genColorActive) return colorAt(ix, iy);   // v128: shared sampler
   if (vScale > 1.0) {
     double srcYf = vRectY0 + iy / vScale;
     int sy0 = (int)srcYf; if (sy0 < 0) sy0 = 0; if (sy0 >= MAP_H) sy0 = MAP_H - 1;
@@ -1752,60 +2566,51 @@ static uint16_t mapPixelAt(int x, int y) {
     int sx0 = (int)srcXf; if (sx0 < 0) sx0 = 0; if (sx0 >= MAP_W) sx0 = MAP_W - 1;
     int sx1 = min(sx0 + 1, MAP_W - 1);
     double fx = srcXf - floor(srcXf); if (fx < 0) fx = 0;
-    int g00 = mapGrayAt(sx0, sy0), g10 = mapGrayAt(sx1, sy0);
-    int g01 = mapGrayAt(sx0, sy1), g11 = mapGrayAt(sx1, sy1);
-    int g = (int)(g00 * (1 - fx) * (1 - fy) + g10 * fx * (1 - fy)
-                + g01 * (1 - fx) * fy + g11 * fx * fy + 0.5);
-    // Zoomed-in rendering fixes (v57): the baked coastline is a dense
-    // blob up close, which used to show as a thick mottled band.
-    // 1) Pick the line class by a darkness^2-weighted vote over the
-    //    3x3 neighbourhood instead of the single darkest pixel
-    //    (kills the white/green speckle along the coast).
-    // 2) Square the darkness so the anti-aliased halo falls back to
-    //    the background and only the line core stays bright (thins
-    //    the band on screen). Fit / 1x views use the box path below
-    //    and are unchanged.
-    long wCoast = 0, wBorder = 0;
-    for (int dy = -1; dy <= 1; dy++)
-      for (int dx = -1; dx <= 1; dx++) {
-        int sx = sx0 + dx; if (sx < 0) sx = 0; if (sx >= MAP_W) sx = MAP_W - 1;
-        int sy = sy0 + dy; if (sy < 0) sy = 0; if (sy >= MAP_H) sy = MAP_H - 1;
-        int dd = 255 - mapGrayAt(sx, sy);
-        long w = (long)dd * dd;
-        if (mapCoastAt(sx, sy)) wCoast += w; else wBorder += w;
-      }
-    bool coast = wCoast >= wBorder;
-    int d0 = 255 - g;
-    int d = d0 * d0 / 255;
-    return (coast ? inkPalW : inkPalG)[d];
+    double s00 = seaMaskBit(sx0, sy0) ? 1 : 0, s10 = seaMaskBit(sx1, sy0) ? 1 : 0;
+    double s01 = seaMaskBit(sx0, sy1) ? 1 : 0, s11 = seaMaskBit(sx1, sy1) ? 1 : 0;
+    double sf = s00 * (1 - fx) * (1 - fy) + s10 * fx * (1 - fy)
+              + s01 * (1 - fx) * fy + s11 * fx * fy;
+    double w00 = inkWhiteAt(sx0, sy0) ? 1 : 0, w10 = inkWhiteAt(sx1, sy0) ? 1 : 0;
+    double w01 = inkWhiteAt(sx0, sy1) ? 1 : 0, w11 = inkWhiteAt(sx1, sy1) ? 1 : 0;
+    double wf = w00 * (1 - fx) * (1 - fy) + w10 * fx * (1 - fy)
+              + w01 * (1 - fx) * fy + w11 * fx * fy;
+    return sf >= 0.5 ? SEA_BLUE : (wf >= 0.5 ? BORDER_GREEN : 0);
   }
   int ys = (int)(vRectY0 + iy / vScale); if (ys < 0) ys = 0; if (ys >= MAP_H) ys = MAP_H - 1;
   int ye = (int)(vRectY0 + (iy + 1) / vScale); if (ye <= ys) ye = ys + 1; if (ye > MAP_H) ye = MAP_H;
   int xs = (int)(vRectX0 + ix / vScale); if (xs < 0) xs = 0; if (xs >= MAP_W) xs = MAP_W - 1;
   int xe = (int)(vRectX0 + (ix + 1) / vScale); if (xe <= xs) xe = xs + 1; if (xe > MAP_W) xe = MAP_W;
-  long sum = 0; int cnt = 0, mn = 255;
-  bool mnC = false;
+  int cnt = 0, seaCnt = 0, whiteCnt = 0;
   for (int sy = ys; sy < ye; sy++)
     for (int sx = xs; sx < xe; sx++) {
-      int v = mapGrayAt(sx, sy); sum += v; cnt++;
-      if (v < mn) { mn = v; mnC = mapCoastAt(sx, sy); }
+      cnt++;
+      if (seaMaskBit(sx, sy)) seaCnt++;
+      else if (inkWhiteAt(sx, sy)) whiteCnt++;
     }
-  int g = cnt ? (int)((sum / cnt + mn) / 2) : 255;
-  return (mnC ? inkPalW : inkPalG)[255 - g];
+  return (cnt && seaCnt * 2 >= cnt) ? SEA_BLUE
+       : (whiteCnt && whiteCnt * 2 >= cnt) ? BORDER_GREEN : 0;   // v110: >=50% (was >=25% - speckle densified at x0.5)
 }
 
 static void drawMap() {
-  if (!mapChunk)   // freed before each ADS-B fetch to give TLS the heap
-    mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
-  if (!inkPalInit) initInkPal();
+  // v137: while a TLS handshake owns the heap (acFetchBusy), do NOT
+  // re-allocate the chunk - emitLine has a line-by-line fallback for
+  // a null chunk, so the frame still renders, just slower, and the
+  // handshake keeps both the escrow hole and the chunk's block.
+  if (!mapChunk && !acFetchBusy)
+    mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  ensureSeaMask();
   computeView();
   vImgRows = (int)lround(vSrcH * vScale);
   vImgCols = (int)lround(vSrcW * vScale);
   bool smooth = (vScale > 1.0);
   uint32_t t0 = millis();
-  G->startWrite();
+  // v112: no frame-long startWrite transaction. Each chunk push is
+  // a standalone pushImage (the v78 restoreMapRect pattern, which
+  // returns only after its transfer completes), so the bus is free
+  // between pushes and the touch panel can be polled mid-render.
   chunkRows = 0;
   for (int y = 0; y < 240; y++) {
+    if (y && (y & 31) == 0) captureTouchDuringRender();
     int iy = y - vYOff;
     if (iy < 0 || iy >= vImgRows) {                 // letterbox margin
       for (int x = 0; x < 320; x++) rowPixBuf[x] = 0;
@@ -1813,6 +2618,14 @@ static void drawMap() {
       continue;
     }
     if (smooth) {
+      if (genColorActive) {   // v128: stored colour image
+        for (int x = 0; x < 320; x++) {
+          int ix = x - vXOff;
+          rowPixBuf[x] = (ix < 0 || ix >= vImgCols) ? 0 : colorAt(ix, iy);
+        }
+        emitLine(y);
+        continue;
+      }
       double srcYf = vRectY0 + iy / vScale;
       int sy0 = (int)srcYf; if (sy0 < 0) sy0 = 0; if (sy0 >= MAP_H) sy0 = MAP_H - 1;
       int sy1 = min(sy0 + 1, MAP_H - 1);
@@ -1824,22 +2637,23 @@ static void drawMap() {
         int sx0 = (int)srcXf; if (sx0 < 0) sx0 = 0; if (sx0 >= MAP_W) sx0 = MAP_W - 1;
         int sx1 = min(sx0 + 1, MAP_W - 1);
         double fx = srcXf - floor(srcXf); if (fx < 0) fx = 0;
-        int g00 = mapGrayAt(sx0, sy0), g10 = mapGrayAt(sx1, sy0);
-        int g01 = mapGrayAt(sx0, sy1), g11 = mapGrayAt(sx1, sy1);
-        int g = (int)(g00 * (1 - fx) * (1 - fy) + g10 * fx * (1 - fy)
-                    + g01 * (1 - fx) * fy + g11 * fx * fy + 0.5);
-        long wCoast = 0, wBorder = 0;
-        for (int dy = -1; dy <= 1; dy++)
-          for (int dx = -1; dx <= 1; dx++) {
-            int sx = sx0 + dx; if (sx < 0) sx = 0; if (sx >= MAP_W) sx = MAP_W - 1;
-            int sy = sy0 + dy; if (sy < 0) sy = 0; if (sy >= MAP_H) sy = MAP_H - 1;
-            int dd = 255 - mapGrayAt(sx, sy);
-            long w = (long)dd * dd;
-            if (mapCoastAt(sx, sy)) wCoast += w; else wBorder += w;
-          }
-        bool coast = wCoast >= wBorder;
-        int d0 = 255 - g;
-        rowPixBuf[x] = (coast ? inkPalW : inkPalG)[d0 * d0 / 255];
+        double s00 = seaMaskBit(sx0, sy0) ? 1 : 0, s10 = seaMaskBit(sx1, sy0) ? 1 : 0;
+        double s01 = seaMaskBit(sx0, sy1) ? 1 : 0, s11 = seaMaskBit(sx1, sy1) ? 1 : 0;
+        double sf = s00 * (1 - fx) * (1 - fy) + s10 * fx * (1 - fy)
+                  + s01 * (1 - fx) * fy + s11 * fx * fy;
+        double w00 = inkWhiteAt(sx0, sy0) ? 1 : 0, w10 = inkWhiteAt(sx1, sy0) ? 1 : 0;
+        double w01 = inkWhiteAt(sx0, sy1) ? 1 : 0, w11 = inkWhiteAt(sx1, sy1) ? 1 : 0;
+        double wf = w00 * (1 - fx) * (1 - fy) + w10 * fx * (1 - fy)
+                  + w01 * (1 - fx) * fy + w11 * fx * fy;
+        rowPixBuf[x] = sf >= 0.5 ? SEA_BLUE : (wf >= 0.5 ? BORDER_GREEN : 0);
+      }
+      emitLine(y);
+      continue;
+    }
+    if (genColorActive) {   // v128: stored colour image
+      for (int x = 0; x < 320; x++) {
+        int ix = x - vXOff;
+        rowPixBuf[x] = (ix < 0 || ix >= vImgCols) ? 0 : colorAt(ix, iy);
       }
       emitLine(y);
       continue;
@@ -1851,21 +2665,18 @@ static void drawMap() {
       if (ix < 0 || ix >= vImgCols) { rowPixBuf[x] = 0; continue; }
       int xs = (int)(vRectX0 + ix / vScale); if (xs < 0) xs = 0; if (xs >= MAP_W) xs = MAP_W - 1;
       int xe = (int)(vRectX0 + (ix + 1) / vScale); if (xe <= xs) xe = xs + 1; if (xe > MAP_W) xe = MAP_W;
-      long sum = 0;
-      int cnt = 0, mn = 255;
-      bool mnC = false;
+      int cnt = 0, seaCnt = 0, whiteCnt = 0;
       for (int sy = ys; sy < ye; sy++)
         for (int sx = xs; sx < xe; sx++) {
-          int v = mapGrayAt(sx, sy); sum += v; cnt++;
-          if (v < mn) { mn = v; mnC = mapCoastAt(sx, sy); }
+          cnt++;
+          if (seaMaskBit(sx, sy)) seaCnt++;
+          else if (inkWhiteAt(sx, sy)) whiteCnt++;
         }
-      // blend the mean with the darkest pixel so thin lines survive
-      int g = cnt ? (int)((sum / cnt + mn) / 2) : 255;
-      rowPixBuf[x] = (mnC ? inkPalW : inkPalG)[255 - g];
+      rowPixBuf[x] = (cnt && seaCnt * 2 >= cnt) ? SEA_BLUE
+                   : (whiteCnt && whiteCnt * 2 >= cnt) ? BORDER_GREEN : 0;   // v110: >=50% (was >=25% - speckle densified at x0.5)
     }
     emitLine(y);
   }
-  G->endWrite();
   Serial.printf("map render: %lu ms (flash)\n", (unsigned long)(millis() - t0));
 }
 
@@ -1875,7 +2686,25 @@ static const int BAR_H = 22;
 static const char* aprsStateText();  // fwd
 
 static char lastBarLeft[32] = "", lastBarMid[48] = "";
+// v175N: bar layout - visible tabs pack from the left (a hidden
+// screen leaves no tab at all), LIST follows the last tab, the
+// status text follows LIST. drawBarF recomputes this every call;
+// the touch handler reads the same globals.
+static int barTabX[3] = {2, 48, 94};
+static const int barTabW[3] = {44, 44, 30};
+static int barListX = 126;
+static int barStatusX = 168;
+static void layoutBar() {
+  int x = 2;
+  for (int i = 0; i < 3; i++) {
+    if ((cfgScreens >> i) & 1) { barTabX[i] = x; x += barTabW[i] + 2; }
+    else barTabX[i] = -1;
+  }
+  barListX = x;
+  barStatusX = x + 38 + 6;
+}
 static void drawBarF(bool force, bool push) {
+  layoutBar();
   computeView();
   char scale[8], mid[48], leftKey[4];
   if (fabs(vScale - lround(vScale)) < 0.01) snprintf(scale, sizeof(scale), "x%d", (int)lround(vScale));
@@ -1894,10 +2723,10 @@ static void drawBarF(bool force, bool push) {
     // blanking and redrawing the whole bar (a visible blink on every
     // 5 s tick and every station update).
     strcpy(lastBarMid, mid);
-    G->fillRect(126, 0, 102, BAR_H, TFT_NAVY);
+    G->fillRect(barStatusX - 2, 0, 268 - (barStatusX - 2), BAR_H, TFT_NAVY);   // status strip only (buttons live right of it)
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_WHITE, TFT_NAVY);
-    G->setCursor(130, 7);
+    G->setCursor(barStatusX, 7);
     G->print(mid);
     if (push && sprOk) spr.pushSprite(0, 0);
     return;
@@ -1905,14 +2734,14 @@ static void drawBarF(bool force, bool push) {
   strcpy(lastBarLeft, leftKey);
   strcpy(lastBarMid, mid);
   G->fillRect(0, 0, 320, BAR_H, TFT_NAVY);
-  // screen tabs: [APRS] [FLIGHT] [AIS] - the active one is filled white
+  // screen tabs: the visible screens only (v175N), packed from
+  // the left - the active one is filled white
   G->setFont(&fonts::Font0);
-  static const struct { int x, w; const char* lb; } TABS[MODE_COUNT] = {
-    {2, 44, "APRS"}, {48, 44, "FLIGHT"}, {94, 30, "AIS"}
-  };
+  static const char* TABLB[MODE_COUNT] = {"APRS", "FLIGHT", "AIS"};
   for (int i = 0; i < MODE_COUNT; i++) {
-    int tx = TABS[i].x, tw = TABS[i].w;
-    const char* lb = TABS[i].lb;
+    if (barTabX[i] < 0) continue;   // hidden screen: no tab
+    int tx = barTabX[i], tw = barTabW[i];
+    const char* lb = TABLB[i];
     if (screenMode == i) {
       G->fillRect(tx, 2, tw, 18, TFT_WHITE);
       G->setTextColor(TFT_NAVY, TFT_WHITE);
@@ -1923,16 +2752,19 @@ static void drawBarF(bool force, bool push) {
     G->setCursor(tx + (tw - G->textWidth(lb)) / 2, 7);
     G->print(lb);
   }
-  // status text in the middle
+  // v171N: [-] [+] are back at the TOP-RIGHT corner (user
+  // request, reversing the v119 move-left). The status text sits
+  // between LIST and the buttons. The corner's touch reads
+  // offset, so the hit boxes (in the touch handler) are wider
+  // than the drawn boxes.
   G->setTextColor(TFT_WHITE, TFT_NAVY);
-  G->setCursor(130, 7);
+  G->setCursor(barStatusX, 7);
   G->print(mid);
-  // buttons: [LIST] [-] [+]
-  G->drawRect(228, 2, 38, 18, TFT_WHITE);
-  G->setCursor(234, 7); G->print("LIST");
-  G->drawRect(269, 2, 23, 18, TFT_WHITE);
+  G->drawRect(barListX, 2, 38, 18, TFT_WHITE);
+  G->setCursor(barListX + 6, 7); G->print("LIST");
+  G->drawRect(268, 2, 24, 18, TFT_WHITE);
   G->setCursor(277, 7); G->print("-");
-  G->drawRect(295, 2, 23, 18, TFT_WHITE);
+  G->drawRect(294, 2, 24, 18, TFT_WHITE);
   G->setCursor(303, 7); G->print("+");
   if (push && sprOk) spr.pushSprite(0, 0);
 }
@@ -1985,6 +2817,7 @@ static void drawStations() {
     G->drawCircle(px, py, sel ? 6 : 5, TFT_BLACK);
     G->fillCircle(px, py, 1, TFT_WHITE);
     // label with a full black halo so it reads on any map colour
+    G->setTextWrap(false);   // labels clip at the right edge; with wrap ON the tail reappears at the left edge
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_BLACK);
     G->setCursor(px + 6, py - 5); G->print(stations[i].call);
@@ -2023,7 +2856,7 @@ static void drawAircraft() {
     strncpy(snapAcFlight[i], aircraft[i].flight, sizeof(snapAcFlight[i]) - 1);
     snapAcFlight[i][sizeof(snapAcFlight[i]) - 1] = 0;
     snapAcTrack[i] = aircraft[i].track;
-    uint16_t col = sel ? TFT_YELLOW : TFT_CYAN;
+    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;   // v172N: APRS orange (user request)
     // small triangle pointing along the track, cyan like a radar plot
     float r = aircraft[i].track * (float)DEG_TO_RAD;
     float sn = sinf(r), cs = cosf(r);
@@ -2033,6 +2866,7 @@ static void drawAircraft() {
     int rx = bx - (int)(5 * cs),  ry = by - (int)(5 * sn);
     G->fillTriangle(nx, ny, lx, ly, rx, ry, col);
     G->fillCircle(px, py, 1, TFT_WHITE);
+    G->setTextWrap(false);   // clip at the right edge, never wrap to the left
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_BLACK);
     G->setCursor(px + 7, py - 5); G->print(aircraft[i].flight);
@@ -2085,7 +2919,7 @@ static void drawShips() {
     snapShipUnder[i] = underway;
     strncpy(snapShipName[i], label, sizeof(snapShipName[i]) - 1);
     snapShipName[i][sizeof(snapShipName[i]) - 1] = 0;
-    uint16_t col = sel ? TFT_YELLOW : TFT_SKYBLUE;
+    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;   // v172N: APRS orange (user request)
     if (underway) {
       // triangle pointing along the course over ground
       float r = ships[i].cog * (float)DEG_TO_RAD;
@@ -2101,6 +2935,7 @@ static void drawShips() {
       G->drawRect(px - 4, py - 4, 9, 9, TFT_BLACK);
     }
     G->fillCircle(px, py, 1, TFT_WHITE);
+    G->setTextWrap(false);   // clip at the right edge, never wrap to the left
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_BLACK);
     G->setCursor(px + 7, py - 5); G->print(label);
@@ -2117,11 +2952,11 @@ static void drawShips() {
 
 // ◀ ▶ ▲ ▼ hints at the screen edges while zoomed in (the pan tap zones)
 static void drawPanHints() {
-  if (zoomLevel <= defaultZoomLevel()) return;
-  G->fillTriangle(8, 120, 2, 112, 2, 128, TFT_SILVER);
-  G->fillTriangle(311, 120, 317, 112, 317, 128, TFT_SILVER);
-  G->fillTriangle(160, BAR_H + 3, 152, BAR_H + 13, 168, BAR_H + 13, TFT_SILVER);
-  G->fillTriangle(160, 237, 152, 227, 168, 227, TFT_SILVER);
+  if (zoomLevel <= 0) return;   // v117: pan hints at x1.0 (the zoomed step)
+  G->fillTriangle(8, 120, 2, 112, 2, 128, TFT_BLACK);   // v174N: black (user: silver was hard to see on the pale map)
+  G->fillTriangle(311, 120, 317, 112, 317, 128, TFT_BLACK);
+  G->fillTriangle(160, BAR_H + 3, 152, BAR_H + 13, 168, BAR_H + 13, TFT_BLACK);
+  G->fillTriangle(160, 237, 152, 227, 168, 227, TFT_BLACK);
 }
 
 // APRS display policy (user request): fixed stations are stored and
@@ -2191,7 +3026,7 @@ static void drawAcDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_CYAN, 0x1082);
+  G->setTextColor(TFT_ORANGE, 0x1082);   // v172N
   G->setCursor(16, 34);
   G->print(a.flight);
   G->setFont(&fonts::Font0);
@@ -2230,7 +3065,7 @@ static void drawShipDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_SKYBLUE, 0x1082);
+  G->setTextColor(TFT_ORANGE, 0x1082);   // v172N
   G->setCursor(16, 34);
   char title[28];
   if (s->name[0]) strncpy(title, s->name, sizeof(title) - 1);
@@ -2342,7 +3177,12 @@ static void restoreMapRect(int x0, int y0, int x1, int y1) {
   // is 1 push, the detail-panel area ~8 pushes, the full map area
   // ~10 - instead of 23 / 190 / 218 line-by-line transfers.
   if (!restoreChunk)
-    restoreChunk = (uint16_t*)heap_caps_malloc(320 * 24 * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
+    // v109: INTERNAL | DMA (DRAM only). With plain INTERNAL this
+    // 15,360 B staging buffer could land in the leftover-IRAM heap
+    // region, whose halfword stores fault - the user's Guru
+    // Meditation (LoadStoreError in restoreMapRect, EXCVADDR
+    // 0x40095944) - the same root cause as the v87 sea-mask panic.
+    restoreChunk = (uint16_t*)heap_caps_malloc(320 * 24 * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
   if (!restoreChunk) {   // allocation failed: v75 line-by-line fallback
     for (int y = y0; y <= y1; y++) {
       for (int x = x0; x <= x1; x++) rowPixBuf[x - x0] = mapPixelAt(x, y);
@@ -2536,7 +3376,7 @@ static void redraw() {
   computeView();
   vImgRows = (int)lround(vSrcH * vScale);
   vImgCols = (int)lround(vSrcW * vScale);
-  if (!inkPalInit) initInkPal();
+  ensureSeaMask();
   static double lastViewLat = 0, lastViewLon = 0;
   static int lastViewZoom = -1, lastViewMap = -1;
   bool viewChanged = centerLat != lastViewLat || centerLon != lastViewLon
@@ -2544,7 +3384,9 @@ static void redraw() {
   bool mapRedrawn = false;
   repairErased = false;
   if (mapDirty || viewChanged) {
+    if (chunkMutex) xSemaphoreTake(chunkMutex, portMAX_DELAY);
     drawMap(); mapDirty = false;
+    if (chunkMutex) xSemaphoreGive(chunkMutex);
     mapRedrawn = true;
     lastViewLat = centerLat; lastViewLon = centerLon;
     lastViewZoom = zoomLevel; lastViewMap = curMap;
@@ -2565,6 +3407,14 @@ static void redraw() {
       markerRepair = false;
       repairErased = true;   // the tap ring may have clipped a marker
     }
+    // v173N: left-edge cleanup (user report: label fragments
+    // sometimes remain at the left edge, on APRS and on AIS).
+    // Every erase rect checks out on paper, so as a guarantee:
+    // whenever any marker erase ran (or the detail panel closed),
+    // repaint the left strip from the map too - no stale fragment
+    // can survive there. Current markers redraw right after this.
+    if (repairErased || (prevDetail && !detailOpen))
+      restoreMapRect(0, BAR_H, 47, 239);
   }
   // v78: unchanged markers may be skipped only when nothing was
   // erased or repainted under them this frame.
@@ -2877,7 +3727,7 @@ static void restoreStations() {
       // room for it next to the map-generation statics, and this
       // one-time migration path can borrow the heap instead.
       PersistStationV1* buf1 =
-          (PersistStationV1*)malloc(n * sizeof(PersistStationV1));
+          (PersistStationV1*)heap_caps_malloc(n * sizeof(PersistStationV1), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);   // v109: DRAM only (byte-accessed)
       size_t got1 = buf1 ? pr.getBytes("tbl", buf1, n * sizeof(PersistStationV1)) : 0;
       if (buf1 && got1 == (size_t)(n * sizeof(PersistStationV1))) {
         for (int i = 0; i < n; i++) {
@@ -3198,7 +4048,21 @@ static void parseAis(const String& msg) {
 // streaming inflater keeps its dictionary between messages, so the
 // server's context takeover works (validated on a host build with
 // python-generated takeover streams before this was written).
-static WiFiClientSecure aisSock;
+static WiFiClientSecure* aisSock = nullptr;   // v170N: heap object
+// v170N: stop() alone does NOT release the TLS transform buffers
+// (the v151N pause freed ~nothing - the fetch-start prints proved
+// it). Deleting the object does. Creation/destruction happen only
+// on the Core 0 task (v165N discipline); Core 1 reads only while
+// aisSockUp, which is set after creation and cleared before any
+// destroy request.
+static void aisSockDestroy() {
+  if (aisSock) { aisSock->stop(); delete aisSock; aisSock = nullptr; }
+}
+static bool aisSockNew() {
+  aisSockDestroy();
+  aisSock = new WiFiClientSecure();
+  return aisSock != nullptr;
+}
 static bool aisSockUp = false;
 static uint32_t aisNextTryMs = 0;
 static uint32_t aisLastRxMs = 0;
@@ -3211,6 +4075,8 @@ static bool wsMsgStarted = false;
 static lgfx_tinfl_decompressor* inflState = nullptr;
 static lgfx_mz_uint8* inflDict = nullptr;
 static size_t inflDictPos = 0;
+static volatile bool inflateReleased = false;   // v143N: pair lent out
+static volatile bool inflateInUse = false;      // v143N: Core 1 inside wsInflate
 
 static void wsInflateReset() {
   if (inflState) { lgfx_tinfl_init(inflState); inflDictPos = 0; }
@@ -3219,15 +4085,93 @@ static void wsInflateReset() {
 // Inflate one permessage-deflate message (its sync-flush tail was
 // stripped on the wire; it is appended back here). The decompressor
 // and its dictionary persist across messages (context takeover).
+static bool wsInflatePrealloc();   // v133: defined below, used in setup
+static bool wsInflateBody(const uint8_t* in, size_t inLen, String& out);
 static bool wsInflate(const uint8_t* in, size_t inLen, String& out) {
-  if (!inflState) {
-    if (mapChunk) { free(mapChunk); mapChunk = nullptr; }   // make room first
-    inflState = (lgfx_tinfl_decompressor*)malloc(sizeof(lgfx_tinfl_decompressor));
-    inflDict = (lgfx_mz_uint8*)malloc(TINFL_LZ_DICT_SIZE);
-    if (!inflState || !inflDict) return false;
+  if (inflateReleased) return false;   // v143N: pair is lent to a handshake
+  if (!inflState || !inflDict) {
+    freeMapChunk();   // make room first
+    // v133: the ADS-B escrow (40 KB) is also handed back - with it
+    // held, the pair below could not be allocated in the colour
+    // mode heap layout and every ship message was dropped SILENTLY
+    // (connect + subscription worked, zero ships ever stored).
+    // The fetch wrapper re-takes the escrow after its next fetch.
+    if (tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
+    // v109: DRAM only - the decompressor byte-accesses both buffers
+    // v144N: dict FIRST - it needs a 32 KB contiguous DMA block;
+    // taking the small state first can split the only hole that
+    // fits it (v143N: reclaim after a handshake failed with
+    // 'AIS inflate: no mem (largest 40948)').
+    if (!inflDict)
+      inflDict = (lgfx_mz_uint8*)heap_caps_malloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!inflState)
+      inflState = (lgfx_tinfl_decompressor*)heap_caps_malloc(sizeof(lgfx_tinfl_decompressor), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!inflState || !inflDict) {
+      // v129: free whichever half succeeded. The old code kept a
+      // lone state pointer, so the NEXT message skipped allocation
+      // and ran the decompressor with a NULL dictionary - a store
+      // to address 0 inside tinfl (the user's StoreProhibited
+      // panic, EXCVADDR 0). The colour mode's different heap layout
+      // (no sea-mask block) is what made the 32 KB dict fail now.
+      if (inflState) { free(inflState); inflState = nullptr; }
+      if (inflDict) { free(inflDict); inflDict = nullptr; }
+      static uint32_t lastNoMemLogMs = 0;   // v133: never fail silently again
+      if (millis() - lastNoMemLogMs > 10000) {
+        lastNoMemLogMs = millis();
+        Serial.printf("AIS inflate: no mem (largest %u)\n",
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      }
+      return false;
+    }
     lgfx_tinfl_init(inflState);
     inflDictPos = 0;
   }
+  // v143N: mark the pair in use so the Core 0 releaser waits for
+  // this decompress to finish before freeing it; the re-check
+  // catches a release that landed during the allocation above.
+  inflateInUse = true;
+  if (inflateReleased || !inflState || !inflDict) { inflateInUse = false; return false; }
+  bool ok = wsInflateBody(in, inLen, out);
+  inflateInUse = false;
+  return ok;
+}
+
+// v133: allocate the inflate pair once at boot, from the freshest
+// heap, instead of lazily at the first ship message.
+static bool wsInflatePrealloc() {
+  if (!inflDict)   // v144N: dict first (see wsInflate)
+    inflDict = (lgfx_mz_uint8*)heap_caps_malloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  if (!inflState)
+    inflState = (lgfx_tinfl_decompressor*)heap_caps_malloc(sizeof(lgfx_tinfl_decompressor), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  if (!inflState || !inflDict) {
+    if (inflState) { free(inflState); inflState = nullptr; }
+    if (inflDict) { free(inflDict); inflDict = nullptr; }
+    return false;
+  }
+  lgfx_tinfl_init(inflState);
+  inflDictPos = 0;
+  return true;
+}
+
+// v143N: lend the pair to a TLS handshake (Core 0) and take it
+// back. The releaser waits out any in-flight decompress on Core 1
+// (bounded, tinfl takes ms); wsInflate drops messages meanwhile.
+static void wsInflateReleasePair() {
+  inflateReleased = true;
+  uint32_t t0 = millis();
+  while (inflateInUse && millis() - t0 < 500) delay(1);
+  if (inflState) { free(inflState); inflState = nullptr; }
+  if (inflDict) { free(inflDict); inflDict = nullptr; }
+  inflDictPos = 0;
+}
+static void wsInflateReclaimPair() {
+  // v149N: no re-allocation - deflate is not negotiated, so the
+  // pair stays unallocated for good (wsInflate's lazy path remains
+  // as a fallback if a compressed frame ever shows up anyway).
+  inflateReleased = false;
+}
+
+static bool wsInflateBody(const uint8_t* in, size_t inLen, String& out) {
   static const lgfx_mz_uint8 tail[4] = {0x00, 0x00, 0xFF, 0xFF};
   size_t off = 0;
   int iter = 0;
@@ -3257,7 +4201,7 @@ static bool wsInflate(const uint8_t* in, size_t inLen, String& out) {
 }
 
 static bool wsSendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
-  if (!aisSockUp) return false;
+  if (!aisSockUp || !aisSock) return false;   // v170N: null guard
   uint8_t hdr[14];
   int h = 0;
   hdr[h++] = 0x80 | (opcode & 0x0F);
@@ -3267,13 +4211,13 @@ static bool wsSendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
   else if (len < 65536) { hdr[h++] = 0x80 | 126; hdr[h++] = (uint8_t)((len >> 8) & 0xFF); hdr[h++] = (uint8_t)(len & 0xFF); }
   else return false;
   memcpy(hdr + h, maskKey, 4); h += 4;
-  if (aisSock.write(hdr, h) != (size_t)h) return false;
+  if (aisSock->write(hdr, h) != (size_t)h) return false;
   uint8_t buf[256];
   size_t sent = 0;
   while (sent < len) {
     size_t n = len - sent; if (n > sizeof(buf)) n = sizeof(buf);
     for (size_t i = 0; i < n; i++) buf[i] = data[sent + i] ^ maskKey[(sent + i) & 3];
-    if (aisSock.write(buf, n) != n) return false;
+    if (aisSock->write(buf, n) != n) return false;
     sent += n;
   }
   return true;
@@ -3314,7 +4258,7 @@ static void wsProcess() {
     }
     int maskOfs = hdrLen;
     if (masked) hdrLen += 4;
-    if (len > 65536) { aisSock.stop(); return; }   // stream desync
+    if (len > 65536) { aisStopReq = true; return; }   // stream desync (v165N: stop via the task)
     if ((uint64_t)wsBuf.length() < (uint64_t)hdrLen + len) return;   // incomplete: wait
     String payload;
     payload.reserve((unsigned int)len + 1);
@@ -3326,9 +4270,13 @@ static void wsProcess() {
       for (uint64_t i = 0; i < len; i++) payload += (char)p[i];
     }
     wsBuf.remove(0, (unsigned int)(hdrLen + (size_t)len));
-    if (op == 0x9) { wsSendFrame(0xA, (const uint8_t*)payload.c_str(), payload.length()); continue; }
+    if (op == 0x9) {   // v165N: the pong is written by the Core 0 task
+      size_t pl = payload.length(); if (pl > sizeof(aisPongBuf)) pl = sizeof(aisPongBuf);
+      memcpy(aisPongBuf, payload.c_str(), pl); aisPongLen = pl; aisPongReq = true;
+      continue;
+    }
     if (op == 0xA) continue;
-    if (op == 0x8) { aisSock.stop(); return; }
+    if (op == 0x8) { aisStopReq = true; return; }
     if (op == 0x1 || op == 0x2) { wsMsg = payload; wsMsgCompressed = rsv1; wsMsgStarted = true; }
     else if (op == 0x0 && wsMsgStarted) { wsMsg += payload; }
     else continue;
@@ -3352,11 +4300,53 @@ static void makeWsKey(char* out) {   // Sec-WebSocket-Key: base64 of 16 random b
   out[o] = 0;
 }
 
+static bool aisConnectDo();   // v134: defined below
+// v165N: every AIS socket write/stop Core 1 used to perform
+// inline, serviced here on the socket-owning Core 0 task.
+static void aisServiceSocketReqs() {
+  if (aisStopReq) { aisStopReq = false; aisSockDestroy(); }   // v170N: delete, not stop
+  if (aisSubSendReq) { aisSubSendReq = false; if (aisSock && aisSock->connected()) sendAisSubscription(); }
+  if (aisPingReq) { aisPingReq = false; if (aisSock && aisSock->connected()) wsSendFrame(0x9, nullptr, 0); }
+  if (aisPongReq) { aisPongReq = false; if (aisSock && aisSock->connected()) wsSendFrame(0xA, aisPongBuf, aisPongLen); }
+}
+
+static bool aisUseReserve = false;   // v166N
+static int aisNoResFails = 0;
 static bool aisConnect() {
-  if (mapChunk) { free(mapChunk); mapChunk = nullptr; }   // TLS handshake headroom
-  aisSock.setInsecure();
-  aisSock.setTimeout(10);
-  if (!aisSock.connect("stream.aisstream.io", 443)) return false;
+  // v166N: the AIS handshake is the smaller of the two, so let
+  // it run WITHOUT the reserve first - the 57 KB hole then stays
+  // intact for the ADS-B fetch (in v165N this connect's session
+  // buffers shrank the reserve to 32 KB and the fetch died at
+  // X509 with ~76 KB total; the v143N pass data point is ~93 KB).
+  // Two consecutive no-reserve failures switch back to freeing
+  // the reserve (the pre-v166N behaviour) for good.
+  if (tlsReserveBytes >= TLS_RESERVE_BYTES) { aisUseReserve = false; aisNoResFails = 0; }   // v170N
+  bool useRes = aisUseReserve;
+  if (useRes && tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
+  wsInflateReleasePair();
+  bool ok = aisConnectDo();
+  wsInflateReclaimPair();
+  if (useRes) tlsReserveRetake();
+  if (!ok && !useRes && ++aisNoResFails >= 2) {
+    aisUseReserve = true;
+    Serial.println("AIS: no-reserve connects failed, will use the reserve from now on");
+  }
+  return ok;
+}
+static bool aisConnectDo() {
+  freeMapChunk();   // v137: handshake headroom (drawMap gates on acFetchBusy)
+  Serial.printf("AIS connect start: dmaFree %u dmaLargest %u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+  if (!aisSockNew()) { Serial.println("AIS: client alloc failed"); return false; }
+  aisSock->setInsecure();
+  aisSock->setTimeout(10);
+  if (!aisSock->connect("stream.aisstream.io", 443)) {
+    char ebuf[80];
+    aisSock->lastError(ebuf, sizeof(ebuf));
+    Serial.printf("AIS connect failed: %s\n", ebuf);
+    return false;
+  }
   char key[28];
   makeWsKey(key);
   String req;
@@ -3367,21 +4357,28 @@ static bool aisConnect() {
   req += "Connection: Upgrade\r\n";
   req += "Sec-WebSocket-Key: "; req += key; req += "\r\n";
   req += "Sec-WebSocket-Version: 13\r\n";
-  req += "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n";
+  // v149N: permessage-deflate is NOT offered any more. The 39 KB
+  // inflate pair cannot coexist with the line-mode sea mask plus
+  // the live TLS session in the DMA pool (reclaim AND lazy alloc
+  // both failed: 'AIS inflate: no mem'), and AIS messages are
+  // small - plain JSON frames cost a little bandwidth and need
+  // no decompression buffer at all.
   req += "User-Agent: APRSMap-ESP32\r\n\r\n";
-  aisSock.print(req);
+  aisSock->print(req);
   String resp;
   uint32_t t0 = millis();
   while (millis() - t0 < 10000 && !resp.endsWith("\r\n\r\n")) {
-    while (aisSock.available()) {
-      resp += (char)aisSock.read();
+    while (aisSock->available()) {
+      resp += (char)aisSock->read();
       if (resp.length() > 4096) break;
     }
-    if (!aisSock.connected() && !aisSock.available()) break;
+    if (!aisSock->connected() && !aisSock->available()) break;
     delay(2);
   }
   if (resp.indexOf(" 101") < 0) {
-    aisSock.stop();
+    Serial.printf("AIS upgrade failed, resp len %u: %.80s\n",
+                  (unsigned)resp.length(), resp.c_str());
+    aisSock->stop();
     return false;
   }
   aisDeflate = resp.indexOf("permessage-deflate") >= 0;
@@ -3397,42 +4394,58 @@ static bool aisConnect() {
 }
 
 static void aisLoop() {
+  if (aisPauseReq) {   // v151N: drop the stream for an ADS-B fetch
+    if (aisSockUp) {
+      aisStopReq = true; aisSockUp = false; aisOnline = false; aisSubConfirmed = false;
+      aisNextTryMs = millis() + 20000;
+      Serial.println("AIS paused for ADS-B fetch (line mode)");
+    }
+    aisPauseReq = false;
+  }
   if (cfgAisKey.length() < 10) return;   // no key set: AIS screen stays empty
   if (WiFi.status() != WL_CONNECTED) {
-    if (aisSockUp) { aisSock.stop(); aisSockUp = false; aisOnline = false; }
+    if (aisSockUp) { aisStopReq = true; aisSockUp = false; aisOnline = false; }
     return;
   }
   uint32_t now = millis();
   if (!aisSockUp) {
-    if (now >= aisNextTryMs) {
-      if (!aisConnect()) aisNextTryMs = now + 15000;
+    // v108: the connect (TLS handshake + up-to-10 s upgrade wait)
+    // runs on the Core 0 task - inline it froze touch for seconds
+    // per attempt, retrying every 15 s while the stream was down.
+    // v164N: the first connect waits for the first ADS-B fetch
+    // (or 30 s) - the fetch needs the reserve hole intact, and
+    // this connect is what fragments it.
+    if (!aisConnectReq && !acFetchBusy && now >= aisNextTryMs
+        && (acFetchedOnce || now > 30000)) {
+      aisConnectReq = true;
+      aisNextTryMs = now + 15000;
     }
-  } else if (!aisSock.connected()) {
+  } else if (!aisSock || !aisSock->connected()) {
     aisSockUp = false; aisOnline = false; aisSubConfirmed = false;
     aisNextTryMs = now + 5000;
     Serial.println("AIS disconnected");
   } else {
     int guard = 4096;
-    while (aisSock.available() && guard-- > 0) {
-      int c = aisSock.read();
+    while (aisSock && aisSock->available() && guard-- > 0) {
+      int c = aisSock->read();
       if (c < 0) break;
       wsBuf += (char)c;
       aisLastRxMs = now;
-      if (wsBuf.length() > 16384) { aisSock.stop(); break; }
+      if (wsBuf.length() > 16384) { aisStopReq = true; aisSockUp = false; aisOnline = false; break; }
     }
     if (aisSockUp) wsProcess();
     if (aisSockUp && now - aisLastRxMs > 120000) {
-      aisSock.stop(); aisSockUp = false; aisOnline = false;
+      aisStopReq = true; aisSockUp = false; aisOnline = false;
       aisNextTryMs = now + 5000;
     }
     // If the confirmation never comes back, resend the subscription
     // (the server treats a resend as a harmless replacement).
     if (aisSockUp && !aisSubConfirmed && now - aisLastSubMs > 10000)
-      sendAisSubscription();
+      aisSubSendReq = true;   // v165N: sent by the Core 0 task
     static uint32_t lastPingMs = 0;
     if (aisSockUp && now - lastPingMs > 30000) {
       lastPingMs = now;
-      wsSendFrame(0x9, nullptr, 0);   // keepalive ping
+      aisPingReq = true;   // v165N: keepalive ping, sent by the Core 0 task
     }
   }
 }
@@ -3452,15 +4465,12 @@ static void clampCenter() {
 
 // ---- screen switching ------------------------------------------------
 static void switchMode(int m) {
+  if (!((cfgScreens >> m) & 1)) return;   // v175N: hidden screen
   if (m == screenMode) return;
-  modeCenterLat[screenMode] = centerLat;
-  modeCenterLon[screenMode] = centerLon;
-  modeZoom[screenMode] = zoomLevel;
+  // v116: centre and zoom are SHARED by all screens (one map, one
+  // view) - switching tabs changes only the objects drawn.
   screenMode = m;
   curMap = MODE_MAP[m];
-  centerLat = modeCenterLat[m];
-  centerLon = modeCenterLon[m];
-  zoomLevel = modeZoom[m];
   selected = -1;
   selAcFlight[0] = 0;
   selShipMmsi = 0;
@@ -3519,12 +4529,13 @@ static void handleListTouch(int x, int y) {
 
 static void handleTouch(int x, int y) {
   tapX = x; tapY = y; tapMs = millis(); tapShown = false;
+  Serial.printf("touch %d,%d mode=%d zoom=%d\n", x, y, screenMode, zoomLevel);   // v115 diag
   if (listOpen) {
     if (y < BAR_H) {   // bar stays live: tabs switch, LIST closes
-      if (x >= 2 && x < 46) switchMode(0);
-      else if (x >= 48 && x < 92) switchMode(1);
-      else if (x >= 94 && x < 124) switchMode(2);
-      else if (x >= 228 && x < 266) listOpen = false;
+      if (barTabX[0] >= 0 && x >= barTabX[0] && x < barTabX[0] + barTabW[0]) switchMode(0);
+      else if (barTabX[1] >= 0 && x >= barTabX[1] && x < barTabX[1] + barTabW[1]) switchMode(1);
+      else if (barTabX[2] >= 0 && x >= barTabX[2] && x < barTabX[2] + barTabW[2]) switchMode(2);
+      else if (x >= barListX && x < barListX + 39) listOpen = false;
       fullRedraw = true;
       return;
     }
@@ -3532,17 +4543,23 @@ static void handleTouch(int x, int y) {
     return;
   }
   if (detailOpen) { detailOpen = false; fullRedraw = true; return; }
-  // bar: tabs, [LIST] [-] [+]
-  if (y < BAR_H) {
-    if (x >= 2 && x < 46) switchMode(0);
-    else if (x >= 48 && x < 92) switchMode(1);
-    else if (x >= 94 && x < 124) switchMode(2);
-    else if (x >= 228 && x < 266) { listOpen = true; listPage = 0; }
-    else if (x >= 269 && x < 292) { if (zoomLevel > 0) { zoomLevel--; clampCenter(); } }
-    else if (x >= 295) { if (zoomLevel < maxZoomLevel()) { zoomLevel++; clampCenter(); } }
-    mapDirty = true;
-    fullRedraw = true;
-    return;
+  // bar: tabs, [LIST], status, [-] [+] (v171N layout). Hit zone
+  // reaches y<70 for the button ranges - bar-aimed taps on this
+  // unit read up to ~50 px low.
+  if (y < BAR_H + 48) {
+    bool acted = true;
+    if (barTabX[0] >= 0 && x >= barTabX[0] && x < barTabX[0] + barTabW[0]) switchMode(0);
+    else if (barTabX[1] >= 0 && x >= barTabX[1] && x < barTabX[1] + barTabW[1]) switchMode(1);
+    else if (barTabX[2] >= 0 && x >= barTabX[2] && x < barTabX[2] + barTabW[2]) switchMode(2);
+    else if (x >= barListX && x < barListX + 39) { listOpen = true; listPage = 0; }
+    else if (x >= 258 && x < 291) { if (zoomLevel > 0) zoomLevel--; clampCenter(); }              // v171N: [-]
+    else if (x >= 292) { if (zoomLevel < maxZoomLevel()) zoomLevel++; clampCenter(); }            // v171N: [+]
+    else acted = false;
+    if (acted || y < BAR_H) {
+      mapDirty = true;
+      fullRedraw = true;
+      return;
+    }
   }
   // nearest visible object of the current screen within 16 px
   int best = -1, bestD = 16 * 16;
@@ -3626,13 +4643,88 @@ static void handleTouch(int x, int y) {
 
 static uint32_t lastPollMs = 0;
 static bool touchWasDown = false;
+// v131: confirmed touch read. On the 024 the XPT2046 shares the
+// display HSPI bus, and a single garbled SPI frame can report
+// z >= 400 with railed coordinates - the device logged phantom
+// presses at (319,219) with nobody touching it. A real finger is
+// still down 6 ms later at nearly the same spot; a one-frame
+// glitch is not. Returns 0 = no touch, 1 = confirmed press,
+// 2 = glitch (caller leaves the press-edge state untouched).
+static int readTouchConfirmed(int& mx, int& my) {
+  touchRoute();
+  TS_Point p = ts.getPoint();
+  if (p.z < 400) return 0;
+  int x1 = constrain(map(p.x, 200, 3700, 319, 0), 0, 319);   // 2432S024: X mirrored
+  int y1 = constrain(map(p.y, 240, 3800, 239, 0), 0, 239);
+  delay(6);
+  TS_Point q = ts.getPoint();
+  // v132 diag: log the RAW samples + PENIRQ (GPIO36) state so a
+  // phantom press can be told apart from a real panel signal.
+  // PENIRQ is active LOW when the panel is physically pressed.
+  int irq = digitalRead(36);
+  // v135: reject railed raw values. The phantom logs showed raw x
+  // pinned at exactly 0 with irq LOW - the panel itself is
+  // registering a faint edge contact (case/bezel pressure or a
+  // failing film), not SPI garbage. A real touch can never reach
+  // the rails: the electrodes end inside the glass (a hard corner
+  // tap reads raw ~(430,3470) here; calibration window is
+  // x 200..3700, y 240..3800). Railed samples are not fingers.
+  bool railed = p.x < 120 || p.x > 3980 || p.y < 120 || p.y > 3980 ||
+                q.x < 120 || q.x > 3980 || q.y < 120 || q.y > 3980;
+  if (railed || q.z < 400 || abs(constrain(map(q.x, 200, 3700, 319, 0), 0, 319) - x1) > 24 ||
+      abs(constrain(map(q.y, 240, 3800, 239, 0), 0, 239) - y1) > 24) {
+    // v136: the phantom contact on the user's unit turned out to
+    // be CONTINUOUS (z hovering at the threshold, irq held LOW),
+    // and the per-glitch print flooded the serial log. Count the
+    // rejections and summarise at most once a minute instead.
+    static uint32_t glitchCount = 0, lastGlitchLogMs = 0;
+    glitchCount++;
+    if (millis() - lastGlitchLogMs > 60000) {
+      lastGlitchLogMs = millis();
+      Serial.printf("touch glitch x%u suppressed (last raw %d,%d z %d irq %d)\n",
+                    (unsigned)glitchCount, p.x, p.y, p.z, irq);
+      glitchCount = 0;
+    }
+    return 2;
+  }
+  int x2 = constrain(map(q.x, 200, 3700, 319, 0), 0, 319);
+  int y2 = constrain(map(q.y, 240, 3800, 239, 0), 0, 239);
+  mx = (x1 + x2) / 2;
+  my = (y1 + y2) / 2;
+  Serial.printf("touch ok raw %d,%d z %d / raw2 %d,%d z2 %d irq %d -> %d,%d\n",
+                p.x, p.y, p.z, q.x, q.y, q.z, irq, mx, my);
+  return 1;
+}
+// v112: mid-render press capture - same edge/debounce rules as
+// touchLoop, but only records the tap; touchLoop fires it.
+static void captureTouchDuringRender() {
+  if (pendingTap) return;
+  int mx, my;
+  int r = readTouchConfirmed(mx, my);
+  if (r == 0) { touchWasDown = false; return; }
+  if (r != 1) return;
+  if (touchWasDown) return;
+  touchWasDown = true;
+  uint32_t now = millis();
+  if (now - lastTouchMs < 300) return;
+  lastTouchMs = now;
+  pendingTapX = mx;
+  pendingTapY = my;
+  pendingTap = true;
+}
 static void touchLoop() {
+  if (pendingTap) {   // v112: a tap captured during a render fires now
+    pendingTap = false;
+    handleTouch(pendingTapX, pendingTapY);
+    return;
+  }
   uint32_t now = millis();
   if (now - lastPollMs < 40) return;           // poll at ~25 Hz
   lastPollMs = now;
-  touchRoute();                                // route VSPI to the touch pins
-  TS_Point p = ts.getPoint();                  // direct poll - no PENIRQ gate
-  if (p.z < 400) { touchWasDown = false; return; }
+  int mx, my;
+  int tr = readTouchConfirmed(mx, my);        // v131: two-sample confirm
+  if (tr == 0) { touchWasDown = false; return; }
+  if (tr != 1) return;                         // glitch: keep edge state
   // One action per press (v73 fix): while the finger stays down, do not
   // fire handleTouch again. A held press used to re-fire after the
   // 300 ms debounce at the SAME screen spot - but the first fire had
@@ -3643,22 +4735,42 @@ static void touchLoop() {
   touchWasDown = true;
   if (now - lastTouchMs < 300) return;         // action debounce
   lastTouchMs = now;
-  int x = constrain(map(p.x, 200, 3700, 319, 0), 0, 319);   // new unit: touch X inverted too (2026-11-15)
-  int y = constrain(map(p.y, 240, 3800, 239, 0), 0, 239);   // new unit: touch Y inverted (2026-11-15)
-  handleTouch(x, y);
+  handleTouch(mx, my);
 }
 
 // ---------------- setup / loop ----------------
 void setup() {
   Serial.begin(115200);
+  // v162N: take the TLS reserve FIRST, while the heap is still
+  // pristine. Taken at setup end (v130) it failed on this unit
+  // ('tls reserve: FAILED') because the DMA pool was already
+  // carved up; freed only around TLS handshakes, it gives them
+  // a 56 KB contiguous DMA home. The v161N evidence: with the
+  // AIS pause NOT actually freeing the stream client's TLS
+  // buffers (fetch start dmaFree stays ~44 KB) the handshake
+  // dies at a random stage (X509 / PK / SSL / NET_RECV).
+  tlsReserveRetake();
+  Serial.printf("tls reserve early: %s (%u bytes)\n",
+                tlsReserve ? "ok" : "FAILED", (unsigned)tlsReserveBytes);
   tft.init();
-  tft.setRotation(2);   // new unit: ILI9342 panel, ROT 2 (diag v4/v5, 2026-11-15)
-  tft.setBrightness(255);
+  tft.setRotation(2);
+  tft.setBrightness(26);   // v150N: 10% (v142N 30% still too bright)
+  // v159N: the v156N post-mortem (user: splash steady at 10%,
+  // then 10%/100% switching in the loop) proves HIGH is the ON
+  // state and the pin follows LEDC fine - the v153N raw drive
+  // 'failed' only because duty 230 meant 90% ON. The loop-time
+  // flicker was esp_timer jitter stretching the ON steps. So:
+  // hardware LEDC, 5 kHz, duty 26 = HIGH 10% = ~10% brightness,
+  // applied both via Light_PWM (header invert now false) and a
+  // raw channel-0 drive commanding the same value.
+  ledcSetup(0, 5000, 8);
+  ledcAttachPin(21, 0);
+  ledcWrite(0, 26);
   tft.fillScreen(TFT_BLACK);
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer 028 v83N");
+  tft.print("APRS Map Viewer 028 v183N");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -3678,12 +4790,32 @@ void setup() {
     Serial.printf("reset reason: %s (%d)\n", rs, (int)rr);
     tft.setFont(&fonts::Font0);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.setCursor(10, 30);
+    tft.setCursor(10, 34);
     tft.printf("prev reset: %s", rs);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    // v107: after an ABNORMAL reset, hold the splash for 10 s with
+    // the reason in large text - the small line was gone before the
+    // user could read it (his report). Normal boots stay fast.
+    if (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
+        rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT) {
+      tft.setFont(&fonts::Font2);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.setCursor(10, 70);
+      tft.printf("RESET: %s", rs);
+      tft.setTextSize(1);
+      tft.setFont(&fonts::Font0);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      delay(10000);
+    }
   }
 
-  touchSPI.begin(25, 39, 32, 33);
+  touchSPI.begin(25, 39, 32, 33);   // v141N fix: the 024 setup line
+  // began the touch SPI on the DISPLAY pins (14,12,13) - on the 024
+  // the bus is shared so that was right there, but here it remapped
+  // the GPIO matrix and stole the panel's SCLK/MISO/MOSI from the
+  // display HSPI: the splash (drawn before this) stayed on screen
+  // forever while every later render clocked into unconnected pins.
   ts.begin(touchSPI);
   ts.setRotation(1);
 
@@ -3704,22 +4836,36 @@ void setup() {
   loadSettings(false);
   bool forcePortal = bootResetWindow();
   if (forcePortal) loadSettings(true);
+  // v175N: if the startup screen is hidden by the portal's screen
+  // selection, open on the first visible screen instead.
+  if (!((cfgScreens >> screenMode) & 1))
+    for (int i = 0; i < MODE_COUNT; i++)
+      if ((cfgScreens >> i) & 1) { screenMode = i; break; }
+  curMap = MODE_MAP[screenMode];
   wifiPhase(forcePortal);
 
   mapGenBoot();   // v79: activate generated maps, or generate them first
-  mgFreeGenBuffers();   // covers mapGenBoot's early returns
-  for (int i = 0; i < MODE_COUNT; i++) {
-    const MapDef& mm = MAP_LIST[MODE_MAP[i]];
-    modeCenterLat[i] = (mm.north + mm.south) / 2;
-    modeCenterLon[i] = (mm.east + mm.west) / 2;
-    modeZoom[i] = (i == 0) ? 1 : 0;   // APRS opens at x1
+  if (!genMapsActive) {   // v103: the baked fallback is single-map too
+    MAP_LIST[0] = MAP_LIST[1];
+    mapGrayPtr[0] = MAP_GRAY[1];
+    mapClassPtr[0] = MAP_CLASS[1];
   }
-  centerLat = modeCenterLat[0];
-  centerLon = modeCenterLon[0];
-  zoomLevel = modeZoom[0];
+  if (!genColorActive)   // v127: colour mode needs no sea mask at
+    buildSeaMask(0);       // all (v88: pre-build on a fresh heap)
+  mgFreeGenBuffers();   // covers mapGenBoot's early returns
+  centerLat = (MAP_LIST[0].north + MAP_LIST[0].south) / 2;   // v116: shared view
+  centerLon = (MAP_LIST[0].east + MAP_LIST[0].west) / 2;
+  zoomLevel = defaultZoomLevel();   // v171N: x0.5 at startup
   // (no frame sprite on this board - see the composition note at G)
 
   aprsSetup();
+  // v104: ADS-B fetch task on Core 0 (see the aircraft globals).
+  acMutex = xSemaphoreCreateMutex();
+  chunkMutex = xSemaphoreCreateMutex();
+  tlsReserveRetake();   // v130, v162N guarded
+  Serial.printf("tls reserve: %s\n", tlsReserve ? "ok" : "FAILED");
+  Serial.println("AIS: plain stream (no deflate, no inflate buffer)");   // v149N
+  xTaskCreatePinnedToCore(acFetchTask, "acFetch", 24576, nullptr, 1, nullptr, 0);
   redraw();
 }
 
@@ -3731,12 +4877,12 @@ void loop() {
   aisLoop();
   touchLoop();
   uint32_t now = millis();
-  if ((!acFetchedOnce || now - lastAcFetchMs > AC_POLL_MS) && WiFi.status() == WL_CONNECTED) {
+  if ((!acFetchedOnce || now - lastAcFetchMs > acIntervalMs) && WiFi.status() == WL_CONNECTED) {
     lastAcFetchMs = now;
     acFetchedOnce = true;
-    fetchAircraft();
-    stationsDirty = true;   // let the batched check redraw if anything moved
+    acFetchReq = true;   // v104: fetched on Core 0, touch stays live
   }
+  if (acDataReady) { acDataReady = false; stationsDirty = true; }
   // NTP clock for the persisted station timestamps
   if (!ntpStarted && WiFi.status() == WL_CONNECTED) {
     configTime(0, 0, "pool.ntp.org", "ntp.nict.jp");

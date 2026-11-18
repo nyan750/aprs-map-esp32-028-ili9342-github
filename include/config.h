@@ -18,11 +18,11 @@
 #define APRS_PORT     14580
 
 // ---- Receive filter: stations around this point ----
-// Default: Takamatsu, Kagawa. The firmware asks APRS-IS for
+// Default example: Tokyo. The firmware asks APRS-IS for
 // stations within FILTER_RANGE_KM of (FILTER_LAT, FILTER_LON).
 // This point is also "home" for distance/bearing in the detail view.
-#define FILTER_LAT      34.3401
-#define FILTER_LON      134.0434
+#define FILTER_LAT      35.6812
+#define FILTER_LON      139.7671
 #define FILTER_RANGE_KM 100
 
 // ---- Stations ----
@@ -38,7 +38,7 @@
 // The four bounds MUST match the geographic area the image shows:
 //   NORTH/SOUTH = latitude of the top/bottom edge
 //   WEST/EAST   = longitude of the left/right edge
-// The values below are examples for the Takamatsu area - replace
+// The values below are examples for the Tokyo area - replace
 // them with the bounds of YOUR images (see README).
 struct MapDef {
   const char* file;
@@ -47,10 +47,12 @@ struct MapDef {
 };
 
 static const MapDef MAPS[3] = {
-  // map1: all of Kagawa prefecture
-  { "/map1.bmp", "MAP1", 34.60, 33.90, 133.40, 134.90 },
-  // map2: Takamatsu / eastern Kagawa
-  { "/map2.bmp", "MAP2", 34.50, 34.10, 133.80, 134.50 },
-  // map3: close-up (Takamatsu city)
-  { "/map3.bmp", "MAP3", 34.42, 34.26, 133.95, 134.15 },
+  // The bounds below are examples for the Tokyo area - replace
+  // them with the bounds of YOUR images (see README).
+  // map1: wide area
+  { "/map1.bmp", "MAP1", 35.90, 35.30, 139.30, 140.20 },
+  // map2: city area
+  { "/map2.bmp", "MAP2", 35.80, 35.55, 139.55, 139.95 },
+  // map3: close-up
+  { "/map3.bmp", "MAP3", 35.72, 35.64, 139.70, 139.83 },
 };
