@@ -393,6 +393,8 @@ static void freeMapChunk() {
   if (chunkMutex) xSemaphoreGive(chunkMutex);
 }
 #define MAP_CHUNK_ROWS 60
+#define MAP_CHUNK_ROWS_BIG 120   // v185N: preferred chunk (2 pushes/frame); falls back to 60
+static int mapChunkCap = MAP_CHUNK_ROWS;   // rows the current mapChunk allocation holds
 static bool acFetchedOnce = false;
 #define AC_POLL_MS 60000
 static int acFailStreak = 0;              // v161N: failure backoff
@@ -750,6 +752,113 @@ struct Station {
 static Station stations[MAX_STATIONS];
 static volatile bool stationsDirty = true;
 static uint32_t packetCount = 0;
+
+// ---------------- station trails (v184N, user request) -------------
+// Moving APRS stations draw like AIS ships (triangle along the
+// course) in red, with their last 10 minutes of track as a red
+// polyline. Points are recorded in upsert() whenever a station has
+// actually moved >= ~30 m; a station counts as "moving" while its
+// in-window track totals >= ~100 m of travel. Trails live in a
+// small pool (most stations never move; DRAM is too tight for a
+// per-station array) and are runtime-only - not persisted, they
+// rebuild from live packets after a reboot.
+#define TRAIL_SLOTS 16
+#define TRAIL_PTS 16
+#define TRAIL_WINDOW_MS 600000UL   // 10 minutes
+struct TrailPt { float lat, lon; uint32_t ms; };
+struct Trail {
+  int16_t station = -1;   // stations[] index, -1 = free slot
+  uint8_t cnt = 0;
+  TrailPt pts[TRAIL_PTS];
+};
+static Trail trails[TRAIL_SLOTS];
+
+static Trail* trailOf(int stationIdx, bool create) {
+  Trail* lru = nullptr;
+  uint32_t lruMs = 0xFFFFFFFF;
+  for (int k = 0; k < TRAIL_SLOTS; k++) {
+    if (trails[k].station == stationIdx) return &trails[k];
+    if (create) {
+      if (trails[k].station < 0) { trails[k].station = (int16_t)stationIdx; trails[k].cnt = 0; return &trails[k]; }
+      uint32_t newest = trails[k].cnt ? trails[k].pts[trails[k].cnt - 1].ms : 0;
+      if (newest < lruMs) { lruMs = newest; lru = &trails[k]; }
+    }
+  }
+  if (create && lru) { lru->station = (int16_t)stationIdx; lru->cnt = 0; return lru; }
+  return nullptr;
+}
+
+static void trailDrop(int stationIdx) {
+  Trail* t = trailOf(stationIdx, false);
+  if (t) { t->station = -1; t->cnt = 0; }
+}
+
+static float trailDistM(double lat1, double lon1, double lat2, double lon2) {
+  double dy = (lat2 - lat1) * 110540.0;
+  double dx = (lon2 - lon1) * 111320.0 * cos((lat1 + lat2) * 0.5 * DEG_TO_RAD);
+  return (float)sqrt(dx * dx + dy * dy);
+}
+
+// In-window statistics of a station's trail (points are stored in
+// chronological order, so the in-window ones form the tail).
+static void trailStats(int i, uint32_t now, int& cnt, uint32_t& oldestMs,
+                       uint32_t& newestMs, float& pathM) {
+  cnt = 0; oldestMs = 0; newestMs = 0; pathM = 0;
+  Trail* t = trailOf(i, false);
+  if (!t) return;
+  double plat = 0, plon = 0;
+  for (int k = 0; k < t->cnt; k++) {
+    if (now - t->pts[k].ms > TRAIL_WINDOW_MS) continue;
+    if (cnt == 0) oldestMs = t->pts[k].ms;
+    else pathM += trailDistM(plat, plon, t->pts[k].lat, t->pts[k].lon);
+    plat = t->pts[k].lat; plon = t->pts[k].lon;
+    newestMs = t->pts[k].ms;
+    cnt++;
+  }
+}
+
+static void trailPush(int i, double lat, double lon, uint32_t ms) {
+  Trail* t = trailOf(i, true);
+  if (!t) return;
+  int drop = 0;   // points that have aged out of the window
+  while (drop < t->cnt && ms - t->pts[drop].ms > TRAIL_WINDOW_MS) drop++;
+  if (drop) {
+    memmove(&t->pts[0], &t->pts[drop], (t->cnt - drop) * sizeof(TrailPt));
+    t->cnt -= (uint8_t)drop;
+  }
+  if (t->cnt > 0) {
+    TrailPt& last = t->pts[t->cnt - 1];
+    if (trailDistM(last.lat, last.lon, lat, lon) < 30.0f) return;   // hop too small
+  }
+  if (t->cnt >= TRAIL_PTS) {   // full: drop the oldest point
+    memmove(&t->pts[0], &t->pts[1], (TRAIL_PTS - 1) * sizeof(TrailPt));
+    t->cnt = TRAIL_PTS - 1;
+  }
+  t->pts[t->cnt].lat = (float)lat;
+  t->pts[t->cnt].lon = (float)lon;
+  t->pts[t->cnt].ms = ms;
+  t->cnt++;
+}
+
+// Bearing (deg) along the newest usable trail segment (>= 15 m),
+// scanning backwards; -1 when there is none.
+static int trailBearing(int i, uint32_t now) {
+  Trail* t = trailOf(i, false);
+  if (!t) return -1;
+  int newest = -1;
+  for (int k = 0; k < t->cnt; k++)
+    if (now - t->pts[k].ms <= TRAIL_WINDOW_MS) newest = k;
+  for (int k = newest; k >= 1; k--) {
+    double lat1 = t->pts[k - 1].lat, lon1 = t->pts[k - 1].lon;
+    double lat2 = t->pts[k].lat, lon2 = t->pts[k].lon;
+    if (trailDistM(lat1, lon1, lat2, lon2) < 15.0f) continue;
+    double dy = (lat2 - lat1) * 110540.0;
+    double dx = (lon2 - lon1) * 111320.0 * cos((lat1 + lat2) * 0.5 * DEG_TO_RAD);
+    int b = (int)(atan2(dx, dy) * RAD_TO_DEG);
+    return (b + 360) % 360;
+  }
+  return -1;
+}
 
 // ---------------- view ----------------
 static int    curMap = 0;
@@ -2101,7 +2210,7 @@ static void emitLine(int y) {
   if (chunkRows == 0) chunkY0 = y;
   memcpy(mapChunk + (size_t)chunkRows * 320, rowPixBuf, 320 * 2);
   chunkRows++;
-  if (chunkRows == MAP_CHUNK_ROWS || y == 239) {
+  if (chunkRows == mapChunkCap || y == 239) {
     G->pushImage(0, chunkY0, 320, chunkRows, mapChunk);
     chunkRows = 0;
   }
@@ -2596,13 +2705,40 @@ static void drawMap() {
   // re-allocate the chunk - emitLine has a line-by-line fallback for
   // a null chunk, so the frame still renders, just slower, and the
   // handshake keeps both the escrow hole and the chunk's block.
-  if (!mapChunk && !acFetchBusy)
-    mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  if (!mapChunk && !acFetchBusy) {
+    // v185N: prefer a 120-row chunk (2 pushes per frame instead of
+    // 4) to shorten the visible band sweep on tap redraws; fall
+    // back to the proven 60 rows when the DMA heap is fragmented.
+    mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS_BIG * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (mapChunk) mapChunkCap = MAP_CHUNK_ROWS_BIG;
+    else {
+      mapChunk = (uint16_t*)heap_caps_malloc(320 * MAP_CHUNK_ROWS * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+      mapChunkCap = MAP_CHUNK_ROWS;
+    }
+  }
   ensureSeaMask();
   computeView();
   vImgRows = (int)lround(vSrcH * vScale);
   vImgCols = (int)lround(vSrcW * vScale);
   bool smooth = (vScale > 1.0);
+  // v185N fast colour sampling (the S3 v5 lesson, user request -
+  // the "scroll" on tap redraws): the source X coordinate walks
+  // in 16.16 fixed point (one multiply per pixel) and the
+  // dim/sea factors become integer multiplies, replacing
+  // colorAt()'s per-pixel double divisions in drawMap. A full
+  // render took ~1.3 s in 60-row bands, which reads as the map
+  // scrolling away. colorAt() itself is unchanged for
+  // restoreMapRect / mapPixelAt (small areas). No per-column
+  // tables: DRAM headroom is only a few hundred bytes (the
+  // v184N link lesson), so everything stays in locals.
+  // Factors as x/256: MAP_DIM 0.65 -> 166, sea 0.42/0.68/0.85
+  // -> 108/174/218.
+  const uint16_t* imgPtr = (const uint16_t*)genColorPtr;
+  int32_t srcStepFp = 0, srcX0Fp = 0;
+  if (genColorActive) {
+    srcStepFp = (int32_t)(65536.0 / vScale + 0.5);
+    srcX0Fp = (int32_t)(vRectX0 * 65536.0 + 0.5);
+  }
   uint32_t t0 = millis();
   // v112: no frame-long startWrite transaction. Each chunk push is
   // a standalone pushImage (the v78 restoreMapRect pattern, which
@@ -2618,10 +2754,33 @@ static void drawMap() {
       continue;
     }
     if (smooth) {
-      if (genColorActive) {   // v128: stored colour image
+      if (genColorActive) {   // v185N: fast integer bilinear (was colorAt per pixel)
+        double srcYf = vRectY0 + iy / vScale;
+        int sy0 = (int)srcYf; if (sy0 < 0) sy0 = 0; if (sy0 >= MAP_H) sy0 = MAP_H - 1;
+        int sy1 = min(sy0 + 1, MAP_H - 1);
+        double fy = srcYf - floor(srcYf); if (fy < 0) fy = 0;
+        int fy8 = (int)(fy * 256.0);
+        const uint16_t* row0p = imgPtr + (size_t)sy0 * MAP_W;
+        const uint16_t* row1p = imgPtr + (size_t)sy1 * MAP_W;
         for (int x = 0; x < 320; x++) {
           int ix = x - vXOff;
-          rowPixBuf[x] = (ix < 0 || ix >= vImgCols) ? 0 : colorAt(ix, iy);
+          if (ix < 0 || ix >= vImgCols) { rowPixBuf[x] = 0; continue; }
+          int32_t fp = srcX0Fp + ix * srcStepFp;
+          int sx0 = fp >> 16; if (sx0 < 0) sx0 = 0; if (sx0 >= MAP_W) sx0 = MAP_W - 1;
+          int sx1 = sx0 + 1; if (sx1 >= MAP_W) sx1 = MAP_W - 1;
+          int fx8 = (fp >> 8) & 0xFF;
+          int r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
+          colorUnpack(row0p[sx0], r00, g00, b00);
+          colorUnpack(row0p[sx1], r10, g10, b10);
+          colorUnpack(row1p[sx0], r01, g01, b01);
+          colorUnpack(row1p[sx1], r11, g11, b11);
+          int rr = ((r00 + ((r10 - r00) * fx8 >> 8)) * (256 - fy8) + (r01 + ((r11 - r01) * fx8 >> 8)) * fy8) >> 8;
+          int gg = ((g00 + ((g10 - g00) * fx8 >> 8)) * (256 - fy8) + (g01 + ((g11 - g01) * fx8 >> 8)) * fy8) >> 8;
+          int bb = ((b00 + ((b10 - b00) * fx8 >> 8)) * (256 - fy8) + (b01 + ((b11 - b01) * fx8 >> 8)) * fy8) >> 8;
+          if (isSeaColor(rr, gg, bb))
+            rowPixBuf[x] = colorPack((rr * 108) >> 8, (gg * 174) >> 8, (bb * 218) >> 8);
+          else
+            rowPixBuf[x] = colorPack((rr * 166) >> 8, (gg * 166) >> 8, (bb * 166) >> 8);
         }
         emitLine(y);
         continue;
@@ -2650,10 +2809,29 @@ static void drawMap() {
       emitLine(y);
       continue;
     }
-    if (genColorActive) {   // v128: stored colour image
+    if (genColorActive) {   // v185N: fast integer box average (was colorAt per pixel)
+      int ys = (int)(vRectY0 + iy / vScale); if (ys < 0) ys = 0; if (ys >= MAP_H) ys = MAP_H - 1;
+      int ye = (int)(vRectY0 + (iy + 1) / vScale); if (ye <= ys) ye = ys + 1; if (ye > MAP_H) ye = MAP_H;
       for (int x = 0; x < 320; x++) {
         int ix = x - vXOff;
-        rowPixBuf[x] = (ix < 0 || ix >= vImgCols) ? 0 : colorAt(ix, iy);
+        if (ix < 0 || ix >= vImgCols) { rowPixBuf[x] = 0; continue; }
+        int32_t fp = srcX0Fp + ix * srcStepFp;
+        int xs = fp >> 16; if (xs < 0) xs = 0; if (xs >= MAP_W) xs = MAP_W - 1;
+        int xe = (fp + srcStepFp) >> 16; if (xe <= xs) xe = xs + 1; if (xe > MAP_W) xe = MAP_W;
+        long rs = 0, gs = 0, bs = 0; int cnt = 0;
+        for (int sy = ys; sy < ye; sy++) {
+          const uint16_t* rowp = imgPtr + (size_t)sy * MAP_W;
+          for (int sx = xs; sx < xe; sx++) {
+            int r, g, b;
+            colorUnpack(rowp[sx], r, g, b);
+            rs += r; gs += g; bs += b; cnt++;
+          }
+        }
+        int ar = (int)(rs / cnt), ag = (int)(gs / cnt), ab = (int)(bs / cnt);
+        if (isSeaColor(ar, ag, ab))
+          rowPixBuf[x] = colorPack((ar * 108) >> 8, (ag * 174) >> 8, (ab * 218) >> 8);
+        else
+          rowPixBuf[x] = colorPack((ar * 166) >> 8, (ag * 166) >> 8, (ab * 166) >> 8);
       }
       emitLine(y);
       continue;
@@ -2687,21 +2865,23 @@ static const char* aprsStateText();  // fwd
 
 static char lastBarLeft[32] = "", lastBarMid[48] = "";
 // v175N: bar layout - visible tabs pack from the left (a hidden
-// screen leaves no tab at all), LIST follows the last tab, the
-// status text follows LIST. drawBarF recomputes this every call;
-// the touch handler reads the same globals.
+// screen leaves no tab at all). drawBarF recomputes this every
+// call; the touch handler reads the same globals.
+// v185N: LIST moves to the top-right, beside [-] [+] (the S3 v7
+// layout, user request - it sat right next to the tabs and was
+// hit by mistake). The status text follows the tabs instead.
 static int barTabX[3] = {2, 48, 94};
 static const int barTabW[3] = {44, 44, 30};
-static int barListX = 126;
-static int barStatusX = 168;
+static int barListX = 226;
+static int barStatusX = 128;
 static void layoutBar() {
   int x = 2;
   for (int i = 0; i < 3; i++) {
     if ((cfgScreens >> i) & 1) { barTabX[i] = x; x += barTabW[i] + 2; }
     else barTabX[i] = -1;
   }
-  barListX = x;
-  barStatusX = x + 38 + 6;
+  barListX = 226;
+  barStatusX = x + 2;
 }
 static void drawBarF(bool force, bool push) {
   layoutBar();
@@ -2723,7 +2903,7 @@ static void drawBarF(bool force, bool push) {
     // blanking and redrawing the whole bar (a visible blink on every
     // 5 s tick and every station update).
     strcpy(lastBarMid, mid);
-    G->fillRect(barStatusX - 2, 0, 268 - (barStatusX - 2), BAR_H, TFT_NAVY);   // status strip only (buttons live right of it)
+    G->fillRect(barStatusX - 2, 0, barListX - 2 - (barStatusX - 2), BAR_H, TFT_NAVY);   // v185N: status strip only (LIST + zoom buttons live right of it)
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_WHITE, TFT_NAVY);
     G->setCursor(barStatusX, 7);
@@ -2753,10 +2933,10 @@ static void drawBarF(bool force, bool push) {
     G->print(lb);
   }
   // v171N: [-] [+] are back at the TOP-RIGHT corner (user
-  // request, reversing the v119 move-left). The status text sits
-  // between LIST and the buttons. The corner's touch reads
-  // offset, so the hit boxes (in the touch handler) are wider
-  // than the drawn boxes.
+  // request, reversing the v119 move-left). v185N: LIST sits at
+  // their left and the status text between the tabs and LIST.
+  // The corner's touch reads offset, so the hit boxes (in the
+  // touch handler) are wider than the drawn boxes.
   G->setTextColor(TFT_WHITE, TFT_NAVY);
   G->setCursor(barStatusX, 7);
   G->print(mid);
@@ -2777,6 +2957,21 @@ static int16_t snapLabelW[MAX_STATIONS];   // label width as drawn (ghost fix)
 static bool snapUsed[MAX_STATIONS] = {};
 static int snapSelected = -2;
 static char snapCall[MAX_STATIONS][20] = {};   // callsign as drawn (v78)
+// v184N: the trail as drawn (erase box + change detection)
+static uint8_t snapTrailCntD[MAX_STATIONS] = {};   // in-window points drawn (0 = no trail)
+static uint32_t snapTrailOldest[MAX_STATIONS] = {};
+static uint32_t snapTrailNewest[MAX_STATIONS] = {};
+static bool snapMoving[MAX_STATIONS] = {};         // drawn as a moving (red triangle) station
+static int16_t snapTrailBox[MAX_STATIONS][4] = {}; // drawn trail bbox x0,y0,x1,y1
+
+static bool trailSigChanged(int i) {
+  int c; uint32_t o, n; float p;
+  trailStats(i, millis(), c, o, n, p);
+  bool moving = c >= 2 && p >= 100.0f;
+  return snapMoving[i] != moving ||
+         snapTrailCntD[i] != (moving ? c : 0) ||
+         snapTrailOldest[i] != o || snapTrailNewest[i] != n;
+}
 // v78: set by redraw() each frame - true only when nothing was erased
 // or repainted under the markers, in which case the draw* functions
 // may skip objects whose on-screen image would not change at all.
@@ -2796,27 +2991,75 @@ static void drawHomeMarker() {
 
 static void drawStations() {
   int px, py;
+  uint32_t nowMs = millis();
   for (int i = 0; i < MAX_STATIONS; i++) {
-    if (!stations[i].used) { snapUsed[i] = false; continue; }
-    if (!geoToPx(stations[i].lat, stations[i].lon, px, py)) { snapUsed[i] = false; continue; }
-    if (py < BAR_H + 4) { snapUsed[i] = false; continue; }
-    if (px < 0 || px >= 320) { snapUsed[i] = false; continue; }   // label would float marker-less
+    if (!stations[i].used) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }
+    if (!geoToPx(stations[i].lat, stations[i].lon, px, py)) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }
+    if (py < BAR_H + 4) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }
+    if (px < 0 || px >= 320) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }   // label would float marker-less
     bool sel = (i == selected);
+    // v184N: a station with a live track (>= 2 points, >= 100 m of
+    // travel inside the last 10 min) is a moving station: red
+    // AIS-style triangle + red trail instead of the orange circle.
+    int tCnt; uint32_t tOld, tNew; float tPath;
+    trailStats(i, nowMs, tCnt, tOld, tNew, tPath);
+    bool moving = tCnt >= 2 && tPath >= 100.0f;
     // v78: this exact marker (position, callsign, selection state)
     // is already on screen and nothing was erased this frame - leave
     // it alone instead of redrawing every label on every update.
+    // v184N: the trail must also be exactly as drawn.
     if (skipUnchanged && snapUsed[i] && px == snapPx[i] && py == snapPy[i] &&
-        sel == (snapSelected == i) && !strcmp(snapCall[i], stations[i].call))
+        sel == (snapSelected == i) && !strcmp(snapCall[i], stations[i].call) &&
+        snapMoving[i] == moving && snapTrailCntD[i] == (moving ? tCnt : 0) &&
+        snapTrailOldest[i] == tOld && snapTrailNewest[i] == tNew)
       continue;
     snapUsed[i] = true; snapPx[i] = px; snapPy[i] = py;
-    snapLabelW[i] = (int16_t)(strlen(stations[i].call) * 6 + 16);
+    snapLabelW[i] = (int16_t)((int)strlen(stations[i].call) * 6 + 16);
     strncpy(snapCall[i], stations[i].call, sizeof(snapCall[i]) - 1);
     snapCall[i][sizeof(snapCall[i]) - 1] = 0;
-    uint16_t dot = sel ? TFT_YELLOW : TFT_ORANGE;   // user-chosen colour
-    G->fillCircle(px, py, sel ? 6 : 5, dot);
-    G->drawCircle(px, py, sel ? 6 : 5, TFT_BLACK);
-    G->fillCircle(px, py, 1, TFT_WHITE);
-    // label with a full black halo so it reads on any map colour
+    snapMoving[i] = moving;
+    snapTrailCntD[i] = moving ? (uint8_t)tCnt : 0;
+    snapTrailOldest[i] = tOld; snapTrailNewest[i] = tNew;
+    uint16_t dot = sel ? TFT_YELLOW : (moving ? TFT_RED : TFT_ORANGE);
+    if (moving) {
+      // the last 10 minutes of track as a red polyline under the marker
+      int bx0 = 32000, by0 = 32000, bx1 = -32000, by1 = -32000;
+      int pvx = 0, pvy = 0; bool havePrev = false;
+      Trail* tr = trailOf(i, false);
+      for (int k = 0; tr && k < tr->cnt; k++) {
+        if (nowMs - tr->pts[k].ms > TRAIL_WINDOW_MS) continue;
+        int qx, qy;
+        if (!geoToPx(tr->pts[k].lat, tr->pts[k].lon, qx, qy)) { havePrev = false; continue; }
+        if (havePrev) G->drawLine(pvx, pvy, qx, qy, TFT_RED);
+        pvx = qx; pvy = qy; havePrev = true;
+        if (qx < bx0) bx0 = qx; if (qx > bx1) bx1 = qx;
+        if (qy < by0) by0 = qy; if (qy > by1) by1 = qy;
+      }
+      if (havePrev && (pvx != px || pvy != py)) {
+        G->drawLine(pvx, pvy, px, py, TFT_RED);
+        if (px < bx0) bx0 = px; if (px > bx1) bx1 = px;
+        if (py < by0) by0 = py; if (py > by1) by1 = py;
+      }
+      if (bx0 > bx1) { bx0 = px - 2; bx1 = px + 2; by0 = py - 2; by1 = py + 2; }
+      snapTrailBox[i][0] = (int16_t)bx0; snapTrailBox[i][1] = (int16_t)by0;
+      snapTrailBox[i][2] = (int16_t)bx1; snapTrailBox[i][3] = (int16_t)by1;
+      // AIS-style triangle pointing along the course (same geometry
+      // as the underway ships)
+      int brg = trailBearing(i, nowMs);
+      if (brg < 0) brg = stations[i].course >= 0 ? stations[i].course : 0;
+      float r = brg * (float)DEG_TO_RAD;
+      float sn = sinf(r), cs = cosf(r);
+      int nx = px + (int)(9 * sn),  ny = py - (int)(9 * cs);
+      int tx = px - (int)(6 * sn),  ty = py + (int)(6 * cs);
+      int lx = tx + (int)(5 * cs),  ly = ty + (int)(5 * sn);
+      int rx2 = tx - (int)(5 * cs), ry2 = ty - (int)(5 * sn);
+      G->fillTriangle(nx, ny, lx, ly, rx2, ry2, dot);
+      G->fillCircle(px, py, 1, TFT_WHITE);
+    } else {
+      G->fillCircle(px, py, sel ? 6 : 5, dot);
+      G->drawCircle(px, py, sel ? 6 : 5, TFT_BLACK);
+      G->fillCircle(px, py, 1, TFT_WHITE);
+    }
     G->setTextWrap(false);   // labels clip at the right edge; with wrap ON the tail reappears at the left edge
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_BLACK);
@@ -2957,6 +3200,19 @@ static void drawPanHints() {
   G->fillTriangle(311, 120, 317, 112, 317, 128, TFT_BLACK);
   G->fillTriangle(160, BAR_H + 3, 152, BAR_H + 13, 168, BAR_H + 13, TFT_BLACK);
   G->fillTriangle(160, 237, 152, 227, 168, 227, TFT_BLACK);
+}
+
+// v184N: a station whose trail changed since it was drawn (new
+// point, or points expiring out of the 10-minute window) needs a
+// repaint on the same once-a-minute gate as the mobile markers.
+static bool trailRepaintNeeded() {
+  int px, py;
+  for (int i = 0; i < MAX_STATIONS; i++) {
+    if (!stations[i].used || !snapUsed[i]) continue;
+    if (!geoToPx(stations[i].lat, stations[i].lon, px, py) || py < BAR_H + 4) continue;
+    if (trailSigChanged(i)) return true;
+  }
+  return false;
 }
 
 // APRS display policy (user request): fixed stations are stored and
@@ -3212,13 +3468,21 @@ static void repairMovedObjects() {
                 py >= BAR_H + 4 && px == snapPx[i] && py == snapPy[i] &&
                 i != selected && i != snapSelected &&
                 !strcmp(snapCall[i], stations[i].call);   // v78: slot reused by another call
-    if (same) continue;
+    // v184N: a drawn trail whose points changed (new point, expiry,
+    // station gone) must be repainted even when the marker is same.
+    bool trailStale = snapTrailCntD[i] >= 2 &&
+        (!stations[i].used || trailSigChanged(i));
+    if (same && !trailStale) continue;
     // Erase with the width that was DRAWN: if this slot has since been
     // reused by a station with a shorter callsign, using the current
     // call left the tail of the previous label on screen (user report).
     int w = snapLabelW[i];
     repairErased = true;
-    restoreMapRect(snapPx[i] - 9, snapPy[i] - 11, snapPx[i] + w, snapPy[i] + 11);
+    if (!same)
+      restoreMapRect(snapPx[i] - 9, snapPy[i] - 11, snapPx[i] + w, snapPy[i] + 11);
+    if (snapTrailCntD[i] >= 2)
+      restoreMapRect(snapTrailBox[i][0] - 2, snapTrailBox[i][1] - 2,
+                     snapTrailBox[i][2] + 2, snapTrailBox[i][3] + 2);
   }
   for (int i = 0; i < MAX_AC; i++) {
     if (snapAcPx[i] < 0) continue;
@@ -3363,7 +3627,7 @@ static void drawList() {
 // or a panel/list restore), so all "already on screen" snapshots are
 // void and the draw* functions must draw everything again.
 static void invalidateSnapshots() {
-  for (int i = 0; i < MAX_STATIONS; i++) snapUsed[i] = false;
+  for (int i = 0; i < MAX_STATIONS; i++) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; }
   snapSelected = -2;
   for (int i = 0; i < MAX_AC; i++) snapAcPx[i] = -1;
   snapAcCount = -1;
@@ -3598,6 +3862,18 @@ static void upsert(Station& st) {
   st.lastMs = millis();
   time_t t = time(nullptr);
   st.lastUnix = t > 1700000000 ? (uint32_t)t : 0;
+  // v184N: record the track for the trail display. A slot taken
+  // over by a different callsign starts with an empty trail; when a
+  // station has moved, its previous position seeds the first point.
+  if (stations[slot].used && strcmp(stations[slot].call, st.call) != 0)
+    trailDrop(slot);
+  if (stations[slot].used && !strcmp(stations[slot].call, st.call)) {
+    Trail* tr = trailOf(slot, false);
+    if ((!tr || tr->cnt == 0) &&
+        trailDistM(stations[slot].lat, stations[slot].lon, st.lat, st.lon) >= 30.0f)
+      trailPush(slot, stations[slot].lat, stations[slot].lon, stations[slot].lastMs);
+    trailPush(slot, st.lat, st.lon, millis());
+  }
   st.used = true;
   stations[slot] = st;
   stationsDirty = true;
@@ -4551,7 +4827,7 @@ static void handleTouch(int x, int y) {
     if (barTabX[0] >= 0 && x >= barTabX[0] && x < barTabX[0] + barTabW[0]) switchMode(0);
     else if (barTabX[1] >= 0 && x >= barTabX[1] && x < barTabX[1] + barTabW[1]) switchMode(1);
     else if (barTabX[2] >= 0 && x >= barTabX[2] && x < barTabX[2] + barTabW[2]) switchMode(2);
-    else if (x >= barListX && x < barListX + 39) { listOpen = true; listPage = 0; }
+    else if (x >= barListX && x < 258) { listOpen = true; listPage = 0; }   // v185N: capped at 258 - the widened [-] hit box keeps its left edge
     else if (x >= 258 && x < 291) { if (zoomLevel > 0) zoomLevel--; clampCenter(); }              // v171N: [-]
     else if (x >= 292) { if (zoomLevel < maxZoomLevel()) zoomLevel++; clampCenter(); }            // v171N: [+]
     else acted = false;
@@ -4770,7 +5046,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer 028 v183N");
+  tft.print("APRS Map Viewer 028 v185N");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -4938,7 +5214,7 @@ void loop() {
   // mobile stations on the APRS screen: repaint once a minute
   if (screenMode == 0 && !detailOpen && now - lastMobileCheckMs > 5000) {
     lastMobileCheckMs = now;
-    if (now - lastMobileDrawMs > 60000 && mobileOnScreenMoved()) {
+    if (now - lastMobileDrawMs > 60000 && (mobileOnScreenMoved() || trailRepaintNeeded())) {
       lastMobileDrawMs = now;
       redraw(); return;
     }
