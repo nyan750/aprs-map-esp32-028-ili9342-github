@@ -3089,6 +3089,92 @@ static float snapAcTrack[MAX_AC];              // heading as drawn (v78)
 static char snapSelAcFlight[12] = "";          // selection as drawn (v78)
 static bool snapDetailIsAc = false;
 
+// ---------------- aircraft trails (v192N, ported from S3 v20) ----
+// A short history polyline behind each aircraft on the FLIGHT
+// screen, drawn length capped at ~56 px (about 1 cm on this
+// panel). One point per fetch, appended when the aircraft has
+// moved >= 250 m from the last stored point; 6 points = up to
+// ~3 min of history at the 30 s poll. Keyed by callsign (the
+// aircraft table is rebuilt every fetch, so indices are not
+// stable); slots are LRU-evicted. Same snapshot/repair pattern
+// as the APRS station trails (v184N).
+#define AC_TRAIL_SLOTS 24
+#define AC_TRAIL_PTS 6
+struct AcTrail {
+  char flight[12] = "";
+  uint8_t cnt = 0;
+  float lat[AC_TRAIL_PTS];
+  float lon[AC_TRAIL_PTS];
+  uint32_t lastMs = 0;
+};
+static AcTrail* acTrails = nullptr;   // heap: static DRAM is full on this build
+static bool acTrailsEnsure() {
+  if (acTrails) return true;
+  acTrails = (AcTrail*)heap_caps_calloc(AC_TRAIL_SLOTS, sizeof(AcTrail), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);   // v193N: INTERNAL alone can land in leftover IRAM and fault on byte access (proven on this build)
+  return acTrails != nullptr;
+}
+static int16_t snapAcTrailBox[MAX_AC][4];   // drawn trail bbox
+static int snapAcTrailCntD[MAX_AC];         // stored points as drawn
+static float snapAcTrailLat[MAX_AC], snapAcTrailLon[MAX_AC];   // newest stored point as drawn
+
+static AcTrail* acTrailOf(const char* flight, bool create) {
+  if (create && !acTrailsEnsure()) return nullptr;
+  if (!acTrails) return nullptr;
+  AcTrail* lru = nullptr; uint32_t lruMs = 0xFFFFFFFF;
+  for (int k = 0; k < AC_TRAIL_SLOTS; k++) {
+    if (acTrails[k].flight[0] && !strcmp(acTrails[k].flight, flight)) return &acTrails[k];
+    if (create) {
+      if (!acTrails[k].flight[0]) {
+        strncpy(acTrails[k].flight, flight, sizeof(acTrails[k].flight) - 1);
+        acTrails[k].flight[sizeof(acTrails[k].flight) - 1] = 0;
+        acTrails[k].cnt = 0;
+        return &acTrails[k];
+      }
+      if (acTrails[k].lastMs < lruMs) { lruMs = acTrails[k].lastMs; lru = &acTrails[k]; }
+    }
+  }
+  if (create && lru) {
+    strncpy(lru->flight, flight, sizeof(lru->flight) - 1);
+    lru->flight[sizeof(lru->flight) - 1] = 0;
+    lru->cnt = 0;
+    return lru;
+  }
+  return nullptr;
+}
+
+static bool acTrailStale(int i) {
+  if (!aircraft[i].flight[0]) return snapAcTrailCntD[i] > 0;
+  AcTrail* t = acTrailOf(aircraft[i].flight, false);
+  int cnt = t ? t->cnt : 0;
+  if (cnt != snapAcTrailCntD[i]) return true;
+  if (cnt > 0 && (t->lat[cnt - 1] != snapAcTrailLat[i] || t->lon[cnt - 1] != snapAcTrailLon[i])) return true;
+  return false;
+}
+
+static void acTrailsUpdate() {
+  uint32_t now = millis();
+  for (int i = 0; i < acCount; i++) {
+    if (!aircraft[i].flight[0]) continue;
+    AcTrail* t = acTrailOf(aircraft[i].flight, true);
+    if (!t) continue;
+    if (t->cnt > 0 && now - t->lastMs > 180000UL) t->cnt = 0;   // long gap: start fresh
+    if (t->cnt > 0) {
+      double dLat = (aircraft[i].lat - t->lat[t->cnt - 1]) * 111320.0;
+      double dLon = (aircraft[i].lon - t->lon[t->cnt - 1]) * 111320.0 * cos(aircraft[i].lat * DEG_TO_RAD);
+      if (dLat * dLat + dLon * dLon < 250.0 * 250.0) { t->lastMs = now; continue; }
+    }
+    if (t->cnt >= AC_TRAIL_PTS) {
+      memmove(&t->lat[0], &t->lat[1], sizeof(float) * (AC_TRAIL_PTS - 1));
+      memmove(&t->lon[0], &t->lon[1], sizeof(float) * (AC_TRAIL_PTS - 1));
+      t->cnt = AC_TRAIL_PTS - 1;
+    }
+    t->lat[t->cnt] = (float)aircraft[i].lat;
+    t->lon[t->cnt] = (float)aircraft[i].lon;
+    t->cnt++;
+    t->lastMs = now;
+  }
+}
+
 static void drawAircraft() {
   int px, py;
   for (int i = 0; i < acCount; i++) {
@@ -3101,13 +3187,42 @@ static void drawAircraft() {
     // triangle rotates with the track, so track must match too.
     if (skipUnchanged && snapAcPx[i] == px && snapAcPy[i] == py &&
         !strcmp(snapAcFlight[i], aircraft[i].flight) &&
-        snapAcTrack[i] == aircraft[i].track && sel == selBefore)
+        snapAcTrack[i] == aircraft[i].track && sel == selBefore &&
+        !acTrailStale(i))   // v192N: trail grew -> redraw
       continue;
     snapAcPx[i] = px; snapAcPy[i] = py;
     strncpy(snapAcFlight[i], aircraft[i].flight, sizeof(snapAcFlight[i]) - 1);
     snapAcFlight[i][sizeof(snapAcFlight[i]) - 1] = 0;
     snapAcTrack[i] = aircraft[i].track;
     uint16_t col = sel ? TFT_YELLOW : TFT_GREEN;   // v188N: bright green (unified with S3 v13; was APRS orange)
+    // v192N: history trail behind the aircraft, drawn length
+    // capped at ~56 px (about 1 cm); the current position is the
+    // final point, stored points are walked newest -> oldest.
+    {
+      AcTrail* t = aircraft[i].flight[0] ? acTrailOf(aircraft[i].flight, false) : nullptr;
+      int tcnt = t ? t->cnt : 0;
+      snapAcTrailCntD[i] = tcnt;
+      if (tcnt > 0) { snapAcTrailLat[i] = t->lat[tcnt - 1]; snapAcTrailLon[i] = t->lon[tcnt - 1]; }
+      int bx0 = px, by0 = py, bx1 = px, by1 = py;
+      if (tcnt > 0) {
+        int cx = px, cy = py; float budget = 56.0f;
+        for (int k = tcnt - 1; k >= 0 && budget > 0; k--) {
+          int qx, qy;
+          if (!geoToPx(t->lat[k], t->lon[k], qx, qy)) break;
+          float dx = (float)(qx - cx), dy = (float)(qy - cy);
+          float seg = sqrtf(dx * dx + dy * dy);
+          if (seg < 1.0f) continue;
+          int ex = qx, ey = qy;
+          if (seg > budget) { ex = cx + (int)(dx * budget / seg); ey = cy + (int)(dy * budget / seg); }
+          G->drawLine(cx, cy, ex, ey, col);
+          if (ex < bx0) bx0 = ex; if (ex > bx1) bx1 = ex;
+          if (ey < by0) by0 = ey; if (ey > by1) by1 = ey;
+          budget -= seg; cx = qx; cy = qy;
+        }
+      }
+      snapAcTrailBox[i][0] = bx0; snapAcTrailBox[i][1] = by0;
+      snapAcTrailBox[i][2] = bx1; snapAcTrailBox[i][3] = by1;
+    }
     // small triangle pointing along the track, cyan like a radar plot
     float r = aircraft[i].track * (float)DEG_TO_RAD;
     float sn = sinf(r), cs = cosf(r);
@@ -3498,10 +3613,18 @@ static void repairMovedObjects() {
                 geoToPx(aircraft[i].lat, aircraft[i].lon, px, py) &&
                 py >= BAR_H + 4 && px == snapAcPx[i] && py == snapAcPy[i] &&
                 snapAcTrack[i] == aircraft[i].track;   // v78: rotated triangle is not "same"
-    if (same) continue;
+    // v192N: a trail that changed must be repainted even when
+    // the marker itself is unchanged.
+    bool trailStale = snapAcTrailCntD[i] > 0 &&
+        (!(i < acCount) || acTrailStale(i));
+    if (same && !trailStale) continue;
     int w = (int)strlen(snapAcFlight[i]) * 6 + 16;
     repairErased = true;
-    restoreMapRect(snapAcPx[i] - 13, snapAcPy[i] - 13, snapAcPx[i] + w, snapAcPy[i] + 13);
+    if (!same)
+      restoreMapRect(snapAcPx[i] - 13, snapAcPy[i] - 13, snapAcPx[i] + w, snapAcPy[i] + 13);
+    if (snapAcTrailCntD[i] > 0)
+      restoreMapRect(snapAcTrailBox[i][0] - 2, snapAcTrailBox[i][1] - 2,
+                     snapAcTrailBox[i][2] + 2, snapAcTrailBox[i][3] + 2);
   }
   for (int i = 0; i < MAX_SHIPS; i++) {
     if (snapShipPx[i] < 0) continue;
@@ -5070,7 +5193,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer 028 v191N");
+  tft.print("APRS Map Viewer 028 v193N");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -5185,7 +5308,7 @@ void loop() {
     acFetchedOnce = true;
     acFetchReq = true;   // v104: fetched on Core 0, touch stays live
   }
-  if (acDataReady) { acDataReady = false; stationsDirty = true; }
+  if (acDataReady) { acDataReady = false; acTrailsUpdate(); stationsDirty = true; }   // v192N: trail points per fetch
   // NTP clock for the persisted station timestamps
   if (!ntpStarted && WiFi.status() == WL_CONNECTED) {
     configTime(0, 0, "pool.ntp.org", "ntp.nict.jp");
