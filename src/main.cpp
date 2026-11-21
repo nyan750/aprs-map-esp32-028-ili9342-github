@@ -871,7 +871,7 @@ static bool   detailOpen = false;
 // keeps its own centre/zoom. AIS shares the Flight screen's map.
 #define MODE_COUNT 3
 static const int MODE_MAP[MODE_COUNT] = {0, 1, 1};   // APRS, Flight, AIS
-static int    screenMode = 0;              // 0 = APRS, 1 = Flight, 2 = AIS
+static int    screenMode = 1;              // 0 = APRS, 1 = Flight, 2 = AIS (v189N: boot on FLIGHT, like S3 v22)
 static double modeCenterLat[MODE_COUNT] = {0, 0, 0}, modeCenterLon[MODE_COUNT] = {0, 0, 0};
 static int    modeZoom[MODE_COUNT] = {0, 0, 0};
 static bool   listOpen = false;
@@ -2131,8 +2131,9 @@ static void computeView() {
   // v171N: FOUR steps again (user request): x0.5 / x1.0 / x1.5 /
   // x2.0, driven by the [-] [+] buttons (the v117 two-step ZOOM
   // toggle is retired).
-  static const double APRS_SCALES[4] = {0.5, 1.0, 1.5, 2.0};
-  int li = zoomLevel; if (li < 0) li = 0; if (li > 3) li = 3;
+  // v186N: SIX steps (user request): x2.5 and x3.0 added.
+  static const double APRS_SCALES[6] = {0.5, 1.0, 1.5, 2.0, 2.5, 3.0};
+  int li = zoomLevel; if (li < 0) li = 0; if (li > 5) li = 5;
   double s = APRS_SCALES[li];
   vScale = s;
   vSrcW = 320.0 / s; if (vSrcW > w) vSrcW = w;
@@ -2170,7 +2171,7 @@ static bool geoToPx(double lat, double lon, int& px, int& py) {
 // Startup/reset zoom: the whole map fitted to the screen (level 0), so
 // the whole map is what you see first. Zoom in with [+] / station taps.
 static int maxZoomLevel() {
-  return 3;   // v171N: four steps (x0.5 .. x2.0)
+  return 5;   // v186N: six steps (x0.5 .. x3.0)
 }
 static int defaultZoomLevel() {
   return 0;   // v171N: every screen opens at x0.5 (user request)
@@ -2289,7 +2290,7 @@ static inline bool inkLineAt(int sx, int sy) {   // unthinned line eligibility
   if (!mapCoastAt(sx, sy)) return true;
   // v108: coast-CLASS ink far from the real sea is a border / river
   // line misclassified at generation time - inland water (irrigation
-  // ponds, rivers) puts 'sea' bits all over the plain, so
+  // irrigation ponds, rivers) puts 'sea' bits all over the plain, so
   // most plain borders came out coast-class and were drawn black.
   // Only ink actually touching the sea mask is a true coastline:
   // keep that black, draw the rest green. Render-side only.
@@ -2876,7 +2877,9 @@ static int barListX = 226;
 static int barStatusX = 128;
 static void layoutBar() {
   int x = 2;
-  for (int i = 0; i < 3; i++) {
+  static const int ORDER[3] = {1, 2, 0};   // v189N: FLIGHT, AIS, APRS (like S3 v22)
+  for (int k = 0; k < 3; k++) {
+    int i = ORDER[k];
     if ((cfgScreens >> i) & 1) { barTabX[i] = x; x += barTabW[i] + 2; }
     else barTabX[i] = -1;
   }
@@ -3060,7 +3063,12 @@ static void drawStations() {
       G->drawCircle(px, py, sel ? 6 : 5, TFT_BLACK);
       G->fillCircle(px, py, 1, TFT_WHITE);
     }
-    G->setTextWrap(false);   // labels clip at the right edge; with wrap ON the tail reappears at the left edge
+    // v183N: setTextWrap(false) - with LGFX's default wrap ON, a label
+    // crossing the RIGHT edge wrapped its tail to the LEFT edge one
+    // line down (the user's "left-edge garbage": e.g. JA5MSG-10 at
+    // px289 showed its tail "SG-10" at x=0). Clip, never wrap.
+    G->setTextWrap(false);
+    // label with a full black halo so it reads on any map colour
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_BLACK);
     G->setCursor(px + 6, py - 5); G->print(stations[i].call);
@@ -3099,7 +3107,7 @@ static void drawAircraft() {
     strncpy(snapAcFlight[i], aircraft[i].flight, sizeof(snapAcFlight[i]) - 1);
     snapAcFlight[i][sizeof(snapAcFlight[i]) - 1] = 0;
     snapAcTrack[i] = aircraft[i].track;
-    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;   // v172N: APRS orange (user request)
+    uint16_t col = sel ? TFT_YELLOW : TFT_GREEN;   // v188N: bright green (unified with S3 v13; was APRS orange)
     // small triangle pointing along the track, cyan like a radar plot
     float r = aircraft[i].track * (float)DEG_TO_RAD;
     float sn = sinf(r), cs = cosf(r);
@@ -3109,7 +3117,7 @@ static void drawAircraft() {
     int rx = bx - (int)(5 * cs),  ry = by - (int)(5 * sn);
     G->fillTriangle(nx, ny, lx, ly, rx, ry, col);
     G->fillCircle(px, py, 1, TFT_WHITE);
-    G->setTextWrap(false);   // clip at the right edge, never wrap to the left
+    G->setTextWrap(false);   // v183N: clip at the right edge, never wrap to the left
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_BLACK);
     G->setCursor(px + 7, py - 5); G->print(aircraft[i].flight);
@@ -3162,7 +3170,7 @@ static void drawShips() {
     snapShipUnder[i] = underway;
     strncpy(snapShipName[i], label, sizeof(snapShipName[i]) - 1);
     snapShipName[i][sizeof(snapShipName[i]) - 1] = 0;
-    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;   // v172N: APRS orange (user request)
+    uint16_t col = sel ? TFT_YELLOW : TFT_CYAN;   // v188N: cyan (unified with S3 v13; was APRS orange)
     if (underway) {
       // triangle pointing along the course over ground
       float r = ships[i].cog * (float)DEG_TO_RAD;
@@ -3178,7 +3186,7 @@ static void drawShips() {
       G->drawRect(px - 4, py - 4, 9, 9, TFT_BLACK);
     }
     G->fillCircle(px, py, 1, TFT_WHITE);
-    G->setTextWrap(false);   // clip at the right edge, never wrap to the left
+    G->setTextWrap(false);   // v183N: clip at the right edge, never wrap to the left
     G->setFont(&fonts::Font0);
     G->setTextColor(TFT_BLACK);
     G->setCursor(px + 7, py - 5); G->print(label);
@@ -3282,7 +3290,7 @@ static void drawAcDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_ORANGE, 0x1082);   // v172N
+  G->setTextColor(TFT_GREEN, 0x1082);   // v188N: match the marker colour
   G->setCursor(16, 34);
   G->print(a.flight);
   G->setFont(&fonts::Font0);
@@ -3321,7 +3329,7 @@ static void drawShipDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_ORANGE, 0x1082);   // v172N
+  G->setTextColor(TFT_CYAN, 0x1082);   // v188N: match the marker colour
   G->setCursor(16, 34);
   char title[28];
   if (s->name[0]) strncpy(title, s->name, sizeof(title) - 1);
@@ -3646,6 +3654,7 @@ static void redraw() {
   bool viewChanged = centerLat != lastViewLat || centerLon != lastViewLon
                   || zoomLevel != lastViewZoom || curMap != lastViewMap;
   bool mapRedrawn = false;
+  bool barRepair = false;   // v187N: tap ring overlapped the bar
   repairErased = false;
   if (mapDirty || viewChanged) {
     if (chunkMutex) xSemaphoreTake(chunkMutex, portMAX_DELAY);
@@ -3670,6 +3679,12 @@ static void redraw() {
       restoreMapRect(tapX - 12, tapY - 12, tapX + 12, tapY + 12);
       markerRepair = false;
       repairErased = true;   // the tap ring may have clipped a marker
+      // v187N: restoreMapRect only repaints the map area (y >=
+      // BAR_H), so a ring drawn over the bar itself - a tap on
+      // [+] / [-] / a tab / LIST - was never erased and stayed as
+      // a yellow ghost on the button (user report). Force a full
+      // bar repaint below when the ring touched the bar.
+      if (tapY < BAR_H + 12) barRepair = true;
     }
     // v173N: left-edge cleanup (user report: label fragments
     // sometimes remain at the left edge, on APRS and on AIS).
@@ -3689,7 +3704,7 @@ static void redraw() {
   // must be repainted; on a marker-only update the bar is untouched
   // on screen, so leave it to drawBarF's own change check instead of
   // forcing a full-bar blink on every update.
-  if (mapRedrawn) drawBarF(true, false);
+  if (mapRedrawn || barRepair) drawBarF(true, false);
   else drawBarF(false, false);
   drawHomeMarker();
   if (screenMode == 0) drawStations();
@@ -5046,7 +5061,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer 028 v185N");
+  tft.print("APRS Map Viewer 028 v189N");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -5114,9 +5129,12 @@ void setup() {
   if (forcePortal) loadSettings(true);
   // v175N: if the startup screen is hidden by the portal's screen
   // selection, open on the first visible screen instead.
-  if (!((cfgScreens >> screenMode) & 1))
-    for (int i = 0; i < MODE_COUNT; i++)
-      if ((cfgScreens >> i) & 1) { screenMode = i; break; }
+  // v189N: "first visible" follows the tab order FLIGHT, AIS, APRS.
+  if (!((cfgScreens >> screenMode) & 1)) {
+    static const int ORDER[3] = {1, 2, 0};
+    for (int k = 0; k < MODE_COUNT; k++)
+      if ((cfgScreens >> ORDER[k]) & 1) { screenMode = ORDER[k]; break; }
+  }
   curMap = MODE_MAP[screenMode];
   wifiPhase(forcePortal);
 
