@@ -396,7 +396,7 @@ static void freeMapChunk() {
 #define MAP_CHUNK_ROWS_BIG 120   // v185N: preferred chunk (2 pushes/frame); falls back to 60
 static int mapChunkCap = MAP_CHUNK_ROWS;   // rows the current mapChunk allocation holds
 static bool acFetchedOnce = false;
-#define AC_POLL_MS 60000
+#define AC_POLL_MS 30000   // v191N: 30 s polls while FLIGHT is shown
 static int acFailStreak = 0;              // v161N: failure backoff
 static uint32_t acIntervalMs = AC_POLL_MS;
 
@@ -4693,6 +4693,14 @@ static void aisLoop() {
     }
     aisPauseReq = false;
   }
+  if (screenMode != 2) {   // v190N: the AIS stream runs only while the AIS screen is shown
+    aisConnectReq = false;
+    if (aisSockUp) {
+      aisStopReq = true; aisSockUp = false; aisOnline = false; aisSubConfirmed = false;
+      Serial.println("AIS stopped (AIS screen not shown)");
+    }
+    return;
+  }
   if (cfgAisKey.length() < 10) return;   // no key set: AIS screen stays empty
   if (WiFi.status() != WL_CONNECTED) {
     if (aisSockUp) { aisStopReq = true; aisSockUp = false; aisOnline = false; }
@@ -4706,8 +4714,7 @@ static void aisLoop() {
     // v164N: the first connect waits for the first ADS-B fetch
     // (or 30 s) - the fetch needs the reserve hole intact, and
     // this connect is what fragments it.
-    if (!aisConnectReq && !acFetchBusy && now >= aisNextTryMs
-        && (acFetchedOnce || now > 30000)) {
+    if (!aisConnectReq && !acFetchBusy && now >= aisNextTryMs) {   // v190N: no v164N wait - fetch and AIS are screen-exclusive now
       aisConnectReq = true;
       aisNextTryMs = now + 15000;
     }
@@ -4761,6 +4768,8 @@ static void switchMode(int m) {
   // v116: centre and zoom are SHARED by all screens (one map, one
   // view) - switching tabs changes only the objects drawn.
   screenMode = m;
+  if (m == 1) { acFetchReq = true; acFetchedOnce = true; lastAcFetchMs = millis(); }   // v190N: fetch immediately on arrival
+  if (m == 2) { aisNextTryMs = 0; }   // v190N: connect immediately on arrival
   curMap = MODE_MAP[m];
   selected = -1;
   selAcFlight[0] = 0;
@@ -5061,7 +5070,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer 028 v189N");
+  tft.print("APRS Map Viewer 028 v191N");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -5171,7 +5180,7 @@ void loop() {
   aisLoop();
   touchLoop();
   uint32_t now = millis();
-  if ((!acFetchedOnce || now - lastAcFetchMs > acIntervalMs) && WiFi.status() == WL_CONNECTED) {
+  if (screenMode == 1 && (!acFetchedOnce || now - lastAcFetchMs > acIntervalMs) && WiFi.status() == WL_CONNECTED) {   // v190N: fetch only while FLIGHT is shown
     lastAcFetchMs = now;
     acFetchedOnce = true;
     acFetchReq = true;   // v104: fetched on Core 0, touch stays live
